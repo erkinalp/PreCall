@@ -1,0 +1,26 @@
+[package]
+name = "precall-store"
+description = "Recall-compatible storage: ukg.db schema + FTS5, si_* semantic index, object store"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+precall-proto.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+rusqlite.workspace = true
+bytes.workspace = true
+uuid.workspace = true
+chrono.workspace = true
+sha2.workspace = true
+aes-gcm.workspace = true
+hkdf.workspace = true
+
+thiserror.workspace = true
+tracing.workspace = true
+tokio = { workspace = true, features = ["fs", "sync"] }
+image.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

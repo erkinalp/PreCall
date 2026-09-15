@@ -1,0 +1,55 @@
+# SPDX-License-Identifier: GPL-2.0-only
+# Server tier: broker + API + AI + web. The Windows client stays native.
+#
+#   PRECALL_PSK=hunter2 PRECALL_API_TOKEN=tok docker compose up --build
+#
+# Client then enrolls with:
+#   precall-client enroll --server YOUR_HOST:3390 --psk hunter2
+
+services:
+  broker:
+    build:
+      context: .
+      dockerfile: deploy/Dockerfile.broker
+    command: ["--self-signed"]   # dev TLS; mount PRECALL_TLS_CERT/KEY for prod
+    environment:
+      PRECALL_PSK: ${PRECALL_PSK:?set PRECALL_PSK}
+    volumes:
+      - data:/data
+    ports:
+      - "3390:3390"
+
+  api:
+    build:
+      context: .
+      dockerfile: deploy/Dockerfile.api
+    environment:
+      PRECALL_API_TOKEN: ${PRECALL_API_TOKEN:-}
+      PRECALL_AI_URL: http://ai:3000
+    volumes:
+      - data:/data
+    ports:
+      - "8080:8080"
+    depends_on:
+      - broker
+      - ai
+
+  ai:
+    build:
+      context: ./ai
+      args:
+        EXTRAS: ""        # build with `--build-arg EXTRAS=ai-cpu` for real models
+    ports:
+      - "3000:3000"
+    # GPU host? swap in a CUDA/ROCm base + EXTRAS=ai-cuda/ai-rocm
+    # and set PRECALL_AI_DEVICE accordingly.
+
+  web:
+    build: ./web
+    ports:
+      - "80:80"
+    depends_on:
+      - api
+
+volumes:
+  data:

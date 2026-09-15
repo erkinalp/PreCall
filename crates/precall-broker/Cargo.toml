@@ -1,0 +1,34 @@
+[package]
+name = "precall-broker"
+description = "Precall connection broker: reverse-capture TLS listener, auth, session ingestion"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+precall-proto.workspace = true
+precall-store.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+tokio-rustls.workspace = true
+rustls.workspace = true
+rustls-pemfile.workspace = true
+webpki-roots.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+bytes.workspace = true
+uuid.workspace = true
+sha2.workspace = true
+chrono.workspace = true
+clap.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+thiserror.workspace = true
+anyhow.workspace = true
+futures-util.workspace = true
+rcgen.workspace = true
+toml = "0.9"
+
+[dev-dependencies]
+tempfile.workspace = true
+precall-mock = { path = "../precall-mock" }

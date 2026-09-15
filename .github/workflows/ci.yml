@@ -1,0 +1,50 @@
+# SPDX-License-Identifier: GPL-2.0-only
+name: ci
+
+on:
+  push:
+    branches: [default]
+  pull_request:
+
+jobs:
+  rust:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable-x86_64-pc-windows-msvc
+      - name: cargo check (workspace)
+        run: cargo check --workspace --all-targets
+      - name: cargo test
+        run: cargo test --workspace
+      - name: clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+  ai:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: sync deps
+        working-directory: ai
+        run: uv sync --extra dev
+      - name: pytest
+        working-directory: ai
+        run: uv run pytest -q
+
+  web:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: install + build
+        working-directory: web
+        run: |
+          npm ci
+          npm run build

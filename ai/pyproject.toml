@@ -1,0 +1,54 @@
+[project]
+name = "precall-ai"
+version = "0.1.0"
+description = "Precall AI pipeline: text/image embeddings, topics, transcription for Precall captures"
+license = { text = "GPL-2.0-only" }
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.32",
+    "pydantic>=2.9",
+    "numpy>=2.1",
+    "pillow>=10.4",
+]
+
+[project.optional-dependencies]
+# CPU-only inference stack (default for most self-hosted installs).
+ai-cpu = [
+    "torch>=2.4,<3",
+    "sentence-transformers>=3.1",
+    "transformers>=4.45,<5",
+]
+# NVIDIA CUDA stack — installs the same packages; PyTorch resolves the
+# CUDA wheel from its own index when invoked with --extra-index-url.
+ai-cuda = [
+    "torch>=2.4,<3",
+    "sentence-transformers>=3.1",
+    "transformers>=4.45,<5",
+]
+# AMD ROCm stack — same story; the torch wheel comes from the ROCm index.
+ai-rocm = [
+    "torch>=2.4,<3",
+    "sentence-transformers>=3.1",
+    "transformers>=4.45,<5",
+]
+# Speech-to-text (optional — PCAUDIO transcription).
+whisper = [
+    "openai-whisper>=20240930",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3",
+    "httpx>=0.27",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["precall_ai"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

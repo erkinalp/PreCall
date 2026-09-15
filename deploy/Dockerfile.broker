@@ -1,0 +1,20 @@
+# SPDX-License-Identifier: GPL-2.0-only
+# Server-side capture broker: TLS listener + ingestion + per-client stores.
+FROM rust:1-bookworm AS build
+WORKDIR /src
+COPY Cargo.toml Cargo.lock* ./
+COPY crates/ ./crates/
+RUN cargo build --release -p precall-broker
+
+FROM debian:bookworm-slim
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=build /src/target/release/precall-broker /usr/local/bin/precall-broker
+EXPOSE 3390
+VOLUME /data
+ENV PRECALL_LISTEN=0.0.0.0:3390 \
+    PRECALL_DATA_ROOT=/data
+# Required at runtime:
+#   PRECALL_PSK      - shared secret client authenticates with
+#   PRECALL_TLS_CERT / PRECALL_TLS_KEY - PEM paths (or pass `serve --self-signed`)
+ENTRYPOINT ["precall-broker", "serve"]

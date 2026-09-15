@@ -1,0 +1,20 @@
+# SPDX-License-Identifier: GPL-2.0-only
+# Query/analytics API + enricher (reads the broker's data root).
+FROM rust:1-bookworm AS build
+WORKDIR /src
+COPY Cargo.toml Cargo.lock* ./
+COPY crates/ ./crates/
+RUN cargo build --release -p precall-api
+
+FROM debian:bookworm-slim
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=build /src/target/release/precall-api /usr/local/bin/precall-api
+EXPOSE 8080
+VOLUME /data
+ENV PRECALL_API_LISTEN=0.0.0.0:8080 \
+    PRECALL_DATA_ROOT=/data
+# Optional:
+#   PRECALL_API_TOKEN  - bearer token(s), comma-separated (empty = loopback-open)
+#   PRECALL_AI_URL     - e.g. http://ai:3000  (unset = local hash embedder)
+ENTRYPOINT ["precall-api"]

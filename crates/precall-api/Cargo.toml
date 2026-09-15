@@ -1,0 +1,31 @@
+[package]
+name = "precall-api"
+description = "Precall query API: timeline, semantic + FTS5 search, snapshots, analytics, live stream"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+precall-proto.workspace = true
+precall-store.workspace = true
+axum.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+bytes.workspace = true
+uuid.workspace = true
+chrono.workspace = true
+clap.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+thiserror.workspace = true
+anyhow.workspace = true
+reqwest.workspace = true
+futures-util.workspace = true
+sha2.workspace = true
+rusqlite.workspace = true
+base64.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
