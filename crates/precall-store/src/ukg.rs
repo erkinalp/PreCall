@@ -22,6 +22,9 @@ pub enum UkgError {
     Json(#[from] serde_json::Error),
 }
 
+/// (Id, RegionKind, OcrText, Bounds) — a `ScreenRegion` row.
+pub type RegionRow = (i64, String, Option<String>, String);
+
 /// One row of the timeline endpoint.
 #[derive(Debug, Clone, Serialize)]
 pub struct TimelineEntry {
@@ -488,7 +491,7 @@ impl Ukg {
     pub fn regions(
         &self,
         wc_id: i64,
-    ) -> Result<Vec<(i64, String, Option<String>, String)>, UkgError> {
+    ) -> Result<Vec<RegionRow>, UkgError> {
         let mut stmt = self.conn.prepare(
             "SELECT \"Id\",\"RegionKind\",\"OcrText\",\"Bounds\"
              FROM \"ScreenRegion\" WHERE \"WindowCaptureId\" = ? ORDER BY \"Id\"",

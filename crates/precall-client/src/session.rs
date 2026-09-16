@@ -96,7 +96,7 @@ impl Connection {
                 return Err(ClientError::Config(format!("rejected: {}", rej.reason)));
             }
         };
-        let framed: Wire = Framed::new(tls, MuxCodec::default());
+        let framed: Wire = Framed::new(tls, MuxCodec);
 
         Ok(Self { framed, hello, client_id, seq: 0, frame_id: 0, surface_id: 1 })
     }

@@ -9,7 +9,7 @@ use image::ImageEncoder;
 /// compression ratio without the latency of a real codec like AVC444).
 pub fn encode_jpeg(bgra: &[u8], width: u32, height: u32, quality: u8) -> Result<Vec<u8>, ClientError> {
     let mut rgb = Vec::with_capacity((width * height * 3) as usize);
-    for px in bgra.chunks_exact(4) {
+    for px in bgra.as_chunks::<4>().0 {
         rgb.extend_from_slice(&[px[2], px[1], px[0]]);
     }
     let mut out = Vec::new();

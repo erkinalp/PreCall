@@ -10,7 +10,6 @@
 use clap::{Parser, Subcommand};
 use precall_client::config::ClientConfig;
 use precall_client::{run, service};
-use std::path::PathBuf;
 
 #[derive(Parser)]
 #[command(name = "precall-client", about = "Precall capture client for Windows")]
@@ -116,7 +115,7 @@ fn main() -> anyhow::Result<()> {
         }
         Cmd::InstallService => {
             let exe = std::env::current_exe()?;
-            let abs = PathBuf::from(exe).canonicalize()?;
+            let abs = exe.canonicalize()?;
             service::install(&abs)?;
             println!("Service 'Precall' installed (start it with: sc start Precall)");
         }

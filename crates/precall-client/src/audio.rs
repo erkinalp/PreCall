@@ -102,17 +102,17 @@ impl Loopback {
                 if flags == 0 && !data.is_null() && byte_len > 0 {
                     let src = std::slice::from_raw_parts(data as *const u8, byte_len);
                     if self.float && self.bits == 32 {
-                        for s in src.chunks_exact(4) {
-                            let f = f32::from_le_bytes(s.try_into().unwrap());
+                        for s in src.as_chunks::<4>().0 {
+                            let f = f32::from_le_bytes(*s);
                             out.push((f.clamp(-1.0, 1.0) * 32767.0) as i16);
                         }
                     } else if self.bits == 16 {
-                        for s in src.chunks_exact(2) {
-                            out.push(i16::from_le_bytes(s.try_into().unwrap()));
+                        for s in src.as_chunks::<2>().0 {
+                            out.push(i16::from_le_bytes(*s));
                         }
                     } else if self.bits == 32 && !self.float {
-                        for s in src.chunks_exact(4) {
-                            let v = i32::from_le_bytes(s.try_into().unwrap());
+                        for s in src.as_chunks::<4>().0 {
+                            let v = i32::from_le_bytes(*s);
                             out.push((v >> 16) as i16);
                         }
                     }

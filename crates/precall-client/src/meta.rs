@@ -164,7 +164,7 @@ unsafe fn aumid_for_window(hwnd: HWND) -> Option<String> {
         let pv = store.GetValue(&pkey).ok()?;
         let s = PropVariantToStringAlloc(&pv).ok()?;
         let out = s.to_string().ok();
-        let _ = CoTaskMemFree(Some(s.0 as *const _));
+        CoTaskMemFree(Some(s.0 as *const _));
         out.filter(|v| !v.is_empty())
     }
 }

@@ -176,34 +176,31 @@ pub fn spawn_capture(output_index: u32) -> Receiver<Result<CaptureFrame, ClientE
     std::thread::Builder::new()
         .name("precall-dxgi".into())
         .spawn(move || {
-            'outer: loop {
-                let mut dup = match Duplicator::new(output_index) {
-                    Ok(d) => d,
-                    Err(e) => {
-                        let _ = tx.send(Err(e));
-                        return;
-                    }
-                };
-                loop {
-                    match dup.next_frame(100) {
-                        Ok(Some(f)) => {
-                            if tx.send(Ok(f)).is_err() {
-                                return;
-                            }
+            let mut dup = match Duplicator::new(output_index) {
+                Ok(d) => d,
+                Err(e) => {
+                    let _ = tx.send(Err(e));
+                    return;
+                }
+            };
+            loop {
+                match dup.next_frame(100) {
+                    Ok(Some(f)) => {
+                        if tx.send(Ok(f)).is_err() {
+                            return;
                         }
-                        Ok(None) => {}
-                        Err(_e) => {
-                            // AccessLost / InvalidCall → recreate once; persistent
-                            // failure propagates and kills the thread.
-                            match Duplicator::new(output_index) {
-                                Ok(d) => {
-                                    dup = d;
-                                    continue;
-                                }
-                                Err(e2) => {
-                                    let _ = tx.send(Err(e2));
-                                    break 'outer;
-                                }
+                    }
+                    Ok(None) => {}
+                    Err(_e) => {
+                        // AccessLost / InvalidCall → recreate once; persistent
+                        // failure propagates and kills the thread.
+                        match Duplicator::new(output_index) {
+                            Ok(d) => {
+                                dup = d;
+                            }
+                            Err(e2) => {
+                                let _ = tx.send(Err(e2));
+                                return;
                             }
                         }
                     }

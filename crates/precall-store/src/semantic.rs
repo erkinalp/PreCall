@@ -162,7 +162,7 @@ fn f32s_to_bytes(v: &[f32]) -> Vec<u8> {
 }
 
 fn bytes_to_f32s(b: &[u8]) -> Vec<f32> {
-    b.chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect()
+    b.as_chunks::<4>().0.iter().map(|c| f32::from_le_bytes(*c)).collect()
 }
 
 fn norm(v: &[f32]) -> f32 {

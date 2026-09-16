@@ -59,7 +59,7 @@ fn mux_codec_round_trip() {
         MuxFrame::new(ChannelId::PcMeta, br#"{"a":1}"#.to_vec()),
         MuxFrame::new(ChannelId::PcCtrl, Vec::<u8>::new()),
     ];
-    let mut codec = MuxCodec::default();
+    let mut codec = MuxCodec;
     let mut buf = BytesMut::new();
     for f in &frames {
         codec.encode(f.clone(), &mut buf).unwrap();
@@ -74,7 +74,7 @@ fn mux_codec_round_trip() {
 #[test]
 fn mux_codec_partial_reads() {
     let frame = MuxFrame::new(ChannelId::PcAudio, vec![9u8; 100]);
-    let mut codec = MuxCodec::default();
+    let mut codec = MuxCodec;
     let mut buf = BytesMut::new();
     codec.encode(frame.clone(), &mut buf).unwrap();
     // Feed one byte at a time — must reassemble exactly.

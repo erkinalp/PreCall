@@ -86,7 +86,7 @@ impl Embedder {
             }
             Embedder::Local => {
                 // Content-hash embedding for image bytes.
-                let mut acc = vec![0u8; 32];
+                let mut acc = [0u8; 32];
                 for chunk in jpeg.chunks(32) {
                     let h = Sha256::digest(chunk);
                     for (a, b) in acc.iter_mut().zip(h.iter()) {
