@@ -316,3 +316,217 @@ mod tests {
         assert!(captures_per_second(capture_interval_ms(200)) < 60.0);
     }
 }
+
+// ---------------------------------------------------------------------------
+// Dirty-rectangle capture
+// ---------------------------------------------------------------------------
+
+/// A rectangle in desktop coordinates, matching the wire's `Rect`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Rect {
+    pub left: i16,
+    pub top: i16,
+    pub right: i16,
+    pub bottom: i16,
+}
+
+impl Rect {
+    pub fn new(left: i16, top: i16, right: i16, bottom: i16) -> Self {
+        Self { left, top, right, bottom }
+    }
+
+    pub fn width(&self) -> i32 {
+        (self.right as i32 - self.left as i32).max(0)
+    }
+
+    pub fn height(&self) -> i32 {
+        (self.bottom as i32 - self.top as i32).max(0)
+    }
+
+    pub fn area(&self) -> i64 {
+        self.width() as i64 * self.height() as i64
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.width() == 0 || self.height() == 0
+    }
+}
+
+/// Biggest rectangle list we will send for one capture. DXGI can report a lot
+/// of tiny rects for a scrolling page; past this, the frame is cheaper as a
+/// keyframe than as a delta.
+pub const MAX_DIRTY_RECTS: usize = 32;
+
+/// What to send for one captured frame.
+#[derive(Debug, Clone, PartialEq)]
+pub enum CapturePlan {
+    /// Send the whole frame (and re-seed the server's surface).
+    Keyframe,
+    /// Send only these rectangles.
+    Regions(Vec<Rect>),
+    /// Nothing changed.
+    Skip,
+}
+
+/// Decide what to send for a frame with these dirty rectangles.
+///
+/// Both operating points fall out of the same rule, which is why it is one
+/// function and not a mode flag:
+///
+/// * **Recall cadence** — the desktop changed, so a keyframe is due anyway
+///   (a record a few seconds apart is a *moment*, and a full frame keeps the
+///   archive independently meaningful); or a small edit sends one tiny delta.
+/// * **streaming** — deltas only, keyframes only when forced (a reconnect, or
+///   when the delta would cost more than the frame).
+///
+/// `moved` says DXGI reported *move* rectangles for this frame: the desktop
+/// scrolled, which DXGI describes as "copy this region to there" rather than
+/// "these pixels changed". The wire has no surface-copy operation, so the whole
+/// frame is sent instead — correct, and cheap enough at any recording cadence.
+///
+/// `force_keyframe` is the caller's policy: a fresh connection must always
+/// start with one, because the server has no surface for this session (and a
+/// reconnected client's surface was dropped with its session).
+pub fn plan_capture(
+    dirty: &[Rect],
+    moved: bool,
+    frame_area: i64,
+    force_keyframe: bool,
+) -> CapturePlan {
+    if force_keyframe || moved {
+        return CapturePlan::Keyframe;
+    }
+    let mut rects: Vec<Rect> = dirty.iter().copied().filter(|r| !r.is_empty()).collect();
+    if rects.is_empty() {
+        return CapturePlan::Skip;
+    }
+    if rects.len() > MAX_DIRTY_RECTS {
+        return CapturePlan::Keyframe;
+    }
+    let covered: i64 = rects.iter().map(|r| r.area()).sum();
+    // Past half the screen the delta is not saving anything worth the
+    // per-rect overhead (each rect is a separate JPEG), so send the frame.
+    if covered * 2 >= frame_area {
+        return CapturePlan::Keyframe;
+    }
+    // Deterministic order: the server applies them onto a surface, so order
+    // does not matter for the result, but a stable order makes captures
+    // comparable in tests and logs.
+    rects.sort_by_key(|r| (r.top, r.left, r.bottom, r.right));
+    CapturePlan::Regions(rects)
+}
+
+/// Copy one BGRA rectangle out of a full frame, tightly packed.
+///
+/// The client encodes each rectangle on its own, which is where the wire and
+/// CPU savings come from: a 200x100 text edit costs a fraction of a full frame.
+/// Returns `None` for a rectangle that does not intersect the frame.
+pub fn extract_bgra_region(
+    bgra: &[u8],
+    frame_width: u32,
+    frame_height: u32,
+    rect: &Rect,
+) -> Option<(Vec<u8>, u32, u32)> {
+    let x0 = rect.left.max(0) as u32;
+    let y0 = rect.top.max(0) as u32;
+    let x1 = (rect.right as i32).min(frame_width as i32).max(0) as u32;
+    let y1 = (rect.bottom as i32).min(frame_height as i32).max(0) as u32;
+    if x1 <= x0 || y1 <= y0 {
+        return None;
+    }
+    let (w, h) = (x1 - x0, y1 - y0);
+    let mut out = Vec::with_capacity((w as usize) * (h as usize) * 4);
+    let stride = (frame_width as usize) * 4;
+    for row in y0..y1 {
+        let start = (row as usize) * stride + (x0 as usize) * 4;
+        let end = start + (w as usize) * 4;
+        if end > bgra.len() {
+            return None;
+        }
+        out.extend_from_slice(&bgra[start..end]);
+    }
+    Some((out, w, h))
+}
+
+#[cfg(test)]
+mod dirty_tests {
+    use super::*;
+
+    #[test]
+    fn a_small_edit_is_a_delta_and_a_large_change_is_a_keyframe() {
+        let screen = 1920 * 1080;
+        assert_eq!(plan_capture(&[], false, screen, false), CapturePlan::Skip);
+        assert_eq!(
+            plan_capture(&[Rect::new(100, 100, 300, 200)], false, screen, false),
+            CapturePlan::Regions(vec![Rect::new(100, 100, 300, 200)])
+        );
+        // Past half the screen: the frame is cheaper than the deltas.
+        assert_eq!(
+            plan_capture(&[Rect::new(0, 0, 1920, 1080)], false, screen, false),
+            CapturePlan::Keyframe
+        );
+        // A forced keyframe (fresh connection) wins over any delta.
+        assert_eq!(
+            plan_capture(&[Rect::new(1, 1, 2, 2)], false, screen, true),
+            CapturePlan::Keyframe
+        );
+        // A scroll is a move rectangle: the wire cannot express a surface copy,
+        // so the frame goes whole.
+        assert_eq!(
+            plan_capture(&[Rect::new(0, 400, 1920, 460)], true, screen, false),
+            CapturePlan::Keyframe
+        );
+    }
+
+    #[test]
+    fn a_scrolling_page_falls_back_to_a_keyframe() {
+        // More rectangles than the per-capture budget: the JPEG overhead per
+        // rect exceeds the saving.
+        let many: Vec<Rect> = (0..(MAX_DIRTY_RECTS as i16 + 1))
+            .map(|i| Rect::new(i, i, i + 1, i + 1))
+            .collect();
+        assert_eq!(
+            plan_capture(&many, false, 1920 * 1080, false),
+            CapturePlan::Keyframe
+        );
+    }
+
+    #[test]
+    fn regions_are_clipped_to_the_frame_and_ordered() {
+        let (w, h) = (8u32, 4u32);
+        // Row-major BGRA with a distinct value per pixel.
+        let mut bgra = Vec::new();
+        for y in 0..h {
+            for x in 0..w {
+                bgra.extend_from_slice(&[x as u8, y as u8, 0, 255]);
+            }
+        }
+        let (region, rw, rh) = extract_bgra_region(&bgra, w, h, &Rect::new(2, 1, 5, 3)).unwrap();
+        assert_eq!((rw, rh), (3, 2));
+        assert_eq!(region.len(), 3 * 2 * 4);
+        assert_eq!(&region[0..4], &[2, 1, 0, 255], "top-left of the rect");
+        assert_eq!(&region[4..8], &[3, 1, 0, 255]);
+        // A rectangle past the edge is clipped, not refused.
+        let (clipped, cw, ch) = extract_bgra_region(&bgra, w, h, &Rect::new(6, 0, 20, 2)).unwrap();
+        assert_eq!((cw, ch), (2, 2));
+        assert_eq!(clipped.len(), 2 * 2 * 4);
+        // A rectangle entirely outside yields nothing.
+        assert!(extract_bgra_region(&bgra, w, h, &Rect::new(50, 50, 60, 60)).is_none());
+    }
+
+    /// The saving that matters: a small rectangle costs a small buffer.
+    #[test]
+    fn a_delta_region_is_a_fraction_of_the_frame() {
+        let (w, h) = (1920u32, 1080u32);
+        let frame = vec![0u8; (w as usize) * (h as usize) * 4];
+        let (region, rw, rh) =
+            extract_bgra_region(&frame, w, h, &Rect::new(100, 100, 300, 200)).unwrap();
+        assert_eq!((rw, rh), (200, 100));
+        assert_eq!(region.len(), 200 * 100 * 4);
+        let full = (w as usize) * (h as usize) * 4;
+        assert!(
+            region.len() * 50 < full,
+            "a 200x100 edit is <1/50 of the frame's bytes"
+        );
+    }
+}

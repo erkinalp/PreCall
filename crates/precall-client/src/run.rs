@@ -38,11 +38,21 @@ enum Prepared {
     Frame(Box<PreparedFrame>),
 }
 
+/// What this capture puts on the wire.
+enum Payload {
+    /// The whole frame — a keyframe, or a change too large to be worth deltas.
+    Full {
+        jpeg: Vec<u8>,
+        width: u32,
+        height: u32,
+    },
+    /// Only the rectangles that changed.
+    Regions(Vec<(precall_frame::Rect, Vec<u8>)>),
+}
+
 /// Everything one capture needs, produced off the runtime thread.
 struct PreparedFrame {
-    jpeg: Vec<u8>,
-    width: u32,
-    height: u32,
+    payload: Payload,
     meta: crate::meta::WindowMeta,
     regions: Vec<precall_proto::metadata::ScreenRegionRecord>,
     urls: Vec<precall_proto::metadata::WebRecord>,
@@ -131,6 +141,9 @@ pub async fn run(cfg: ClientConfig, mut stop: watch::Receiver<bool>) -> Result<(
         let mut hb_tick =
             tokio::time::interval(std::time::Duration::from_millis(conn.hello.heartbeat_interval_ms.max(5000) as u64));
         let mut latest_frame: Option<crate::dxgi::CaptureFrame> = None;
+        // A keyframe first: the server has no surface for this connection, and
+        // a reconnected client's surface died with its session.
+        let mut force_keyframe = true;
         let mut pending: std::collections::VecDeque<u64> = std::collections::VecDeque::new();
 
         loop {
@@ -152,16 +165,21 @@ pub async fn run(cfg: ClientConfig, mut stop: watch::Receiver<bool>) -> Result<(
                 }
                 _ = capture_tick.tick() => {
                     let Some(frame) = latest_frame.take() else { continue };
-                    // Dedup on the content fingerprint. DXGI redelivers an
-                    // identical desktop around mode changes, and a moved pointer
-                    // changes metadata but no pixels; neither is worth a
-                    // capture, a JPEG, or a link slot.
-                    let hash = precall_frame::frame_fingerprint(&frame.bgra);
-                    if hash == last_hash {
-                        counters.frames_skipped_unchanged += 1;
-                        continue;
+                    // When DXGI gives us dirty rectangles they are the
+                    // authoritative change signal (and an empty list means the
+                    // desktop did not change), so the 1.18 ms fingerprint is
+                    // skipped. It still guards the fallback path, where
+                    // metadata is unavailable: DXGI redelivers an identical
+                    // desktop around mode changes, and a moved pointer changes
+                    // metadata but no pixels.
+                    if frame.dirty.is_none() {
+                        let hash = precall_frame::frame_fingerprint(&frame.bgra);
+                        if hash == last_hash {
+                            counters.frames_skipped_unchanged += 1;
+                            continue;
+                        }
+                        last_hash = hash;
                     }
-                    last_hash = hash;
 
                     // Everything below is per-capture CPU — 58 ms for a
                     // desktop-like 1080p frame and 117 ms for photographic
@@ -169,9 +187,29 @@ pub async fn run(cfg: ClientConfig, mut stop: watch::Receiver<bool>) -> Result<(
                     // It runs on the blocking pool: on the reactor it would
                     // stall this loop, and the whole point of the cadence is
                     // that the *next* capture is decided on time.
+                    // What to send for this frame. The policy is pure and
+                    // tested (`precall_frame::plan_capture`); unreadable
+                    // metadata and scrolled frames force a keyframe, a fresh
+                    // connection always starts with one (the server has no
+                    // surface for this session yet).
+                    let plan = match (&frame.dirty, frame.moved) {
+                        (Some(dirty), false) if !force_keyframe => precall_frame::plan_capture(
+                            dirty,
+                            false,
+                            (frame.width as i64) * (frame.height as i64),
+                            false,
+                        ),
+                        _ => precall_frame::CapturePlan::Keyframe,
+                    };
+                    if plan == precall_frame::CapturePlan::Skip {
+                        counters.frames_skipped_unchanged += 1;
+                        continue;
+                    }
+
                     let prepare = {
                         let exclusions = exclusions.clone();
                         let enable_ocr = cfg.enable_ocr;
+                        let region_plan = plan.clone();
                         let (bgra, width, height) = (frame.bgra, frame.width, frame.height);
                         tokio::task::spawn_blocking(move || -> Result<Prepared, crate::ClientError> {
                             let meta = foreground_meta();
@@ -183,7 +221,36 @@ pub async fn run(cfg: ClientConfig, mut stop: watch::Receiver<bool>) -> Result<(
                                 Some(DropReason::NoWindow) => return Ok(Prepared::NoWindow),
                                 Some(_) => return Ok(Prepared::Dropped),
                             }
-                            let jpeg = encode_jpeg(&bgra, width, height, 80)?;
+                            // The CPU win: a delta encodes a few small
+                            // rectangles instead of 8 MiB of pixels.
+                            let payload = match &region_plan {
+                                precall_frame::CapturePlan::Regions(rects) => {
+                                    let mut out = Vec::with_capacity(rects.len());
+                                    for r in rects {
+                                        if let Some((region, rw, rh)) = precall_frame::extract_bgra_region(
+                                            &bgra, width, height, r,
+                                        ) {
+                                            if let Ok(jpeg) = encode_jpeg(&region, rw, rh, 80) {
+                                                out.push((*r, jpeg));
+                                            }
+                                        }
+                                    }
+                                    if out.is_empty() {
+                                        Payload::Full {
+                                            jpeg: encode_jpeg(&bgra, width, height, 80)?,
+                                            width,
+                                            height,
+                                        }
+                                    } else {
+                                        Payload::Regions(out)
+                                    }
+                                }
+                                _ => Payload::Full {
+                                    jpeg: encode_jpeg(&bgra, width, height, 80)?,
+                                    width,
+                                    height,
+                                },
+                            };
                             let regions = if enable_ocr {
                                 ocr_bgra(&bgra, width, height).unwrap_or_default()
                             } else {
@@ -196,9 +263,7 @@ pub async fn run(cfg: ClientConfig, mut stop: watch::Receiver<bool>) -> Result<(
                             };
                             let files = explorer_paths();
                             Ok(Prepared::Frame(Box::new(PreparedFrame {
-                                jpeg,
-                                width,
-                                height,
+                                payload,
                                 meta,
                                 regions,
                                 urls,
@@ -224,7 +289,7 @@ pub async fn run(cfg: ClientConfig, mut stop: watch::Receiver<bool>) -> Result<(
                             continue;
                         }
                     };
-                    let PreparedFrame { jpeg, width, height, meta, regions, urls, files } = prepared;
+                    let PreparedFrame { payload, meta, regions, urls, files } = prepared;
                     let token = uuid::Uuid::new_v4().to_string();
                     let now = filetime_now();
                     pending.push_back(now);
@@ -248,7 +313,13 @@ pub async fn run(cfg: ClientConfig, mut stop: watch::Receiver<bool>) -> Result<(
                         webs: urls,
                         regions,
                     };
-                    if let Err(e) = conn.send_frame(&jpeg, width, height, now as u64).await {
+                    let sent = match &payload {
+                        Payload::Full { jpeg, width, height } => {
+                            conn.send_frame(jpeg, *width, *height, now as u64).await
+                        }
+                        Payload::Regions(rs) => conn.send_regions(rs, now as u64).await,
+                    };
+                    if let Err(e) = sent {
                         tracing::warn!("frame send: {e}");
                         break;
                     }
@@ -257,6 +328,8 @@ pub async fn run(cfg: ClientConfig, mut stop: watch::Receiver<bool>) -> Result<(
                         break;
                     }
                     counters.frames_sent += 1;
+                    // From here the server holds a surface for this session.
+                    force_keyframe = false;
                 }
                 _ = hb_tick.tick() => {
                     counters.frames_dropped = frames.dropped();

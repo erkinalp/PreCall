@@ -36,6 +36,10 @@ pub struct ClientStore {
     pub objects: ObjectStore,
     pub text_index: SemanticIndex,
     pub image_index: SemanticIndex,
+    /// The client's desktop surface, maintained only once a client proves it
+    /// sends dirty rectangles. A full-frame-only client never pays a decode:
+    /// its frames are archived verbatim, exactly as before.
+    pub canvas: std::sync::Arc<std::sync::Mutex<Option<crate::canvas::Canvas>>>,
 }
 
 pub struct Broker {
@@ -118,7 +122,13 @@ impl Broker {
         let image_index =
             SemanticIndex::open(&dir.join("SemanticImageStore.db"), self.config.embedding_dim, "image")?;
         info!(%client_id, "opened client store at {}", dir.display());
-        Ok(ClientStore { ukg, objects, text_index, image_index })
+        Ok(ClientStore {
+            ukg,
+            objects,
+            text_index,
+            image_index,
+            canvas: std::sync::Arc::new(std::sync::Mutex::new(None)),
+        })
     }
 
     async fn handle_conn(
@@ -273,31 +283,40 @@ impl Broker {
             // are produced in the same order).
             let frame = pending.pop_front();
             if let Some(f) = frame {
-                // Only a *single* region is the codec's own stream. A
-                // multi-region frame is the assembler's concatenation
-                // (`[l,t,r,b,len][data]…`), so calling it `.jpg` would store a
-                // corrupt image, serve it as `image/jpeg`, and hand garbage to
-                // the image embedder.
-                let ext = if f.regions == 1 && f.codec_id == RDPGFX_CODECID_JPEG {
-                    "jpg"
-                } else {
-                    if f.regions > 1 {
-                        warn!(
-                            regions = f.regions,
-                            "multi-region frame stored as a region blob (compositing not implemented)"
-                        );
-                    }
-                    "raw"
-                };
                 let ts = capture.timestamp_100ns as i64;
                 let date = filetime_to_ymd(ts);
-                store.objects.put(
-                    &client_id.to_string(),
-                    date,
-                    &capture.image_token,
-                    ext,
-                    &f.data,
-                )?;
+                let cid = client_id.to_string();
+
+                // What gets archived for this capture. Dirty rectangles are
+                // applied to the client's surface and the *composed* desktop is
+                // archived as an ordinary JPEG, so every reader — snapshot
+                // route, image embedder, timeline, export — keeps seeing one
+                // full-frame image per capture, exactly as Recall's own store
+                // does. (RDPEGFX composes into a surface the same way.)
+                let payload: Option<(&str, bytes::Bytes)> = if f.regions == 1
+                    && f.codec_id == RDPGFX_CODECID_JPEG
+                {
+                    // A keyframe: archive it verbatim, and keep the surface
+                    // current from it when this client also sends rectangles.
+                    if store.canvas.lock().unwrap().is_some() {
+                        match crate::canvas::Canvas::from_jpeg(&f.data) {
+                            Ok(c) => *store.canvas.lock().unwrap() = Some(c),
+                            Err(e) => warn!(client = %client_id, "keyframe not decodable: {e}"),
+                        }
+                    }
+                    Some(("jpg", f.data.clone()))
+                } else if f.regions > 1 {
+                    match compose_dirty_rects(store, &cid, &f) {
+                        Some(jpeg) => Some(("jpg", jpeg)),
+                        None => Some(("raw", f.data.clone())),
+                    }
+                } else {
+                    Some(("raw", f.data.clone()))
+                };
+
+                if let Some((ext, bytes)) = payload {
+                    store.objects.put(&cid, date, &capture.image_token, ext, &bytes)?;
+                }
             }
             let wc_id = store.ukg.insert_capture(capture)?;
             let _ = self.live_tx.send(LiveEvent {
@@ -309,6 +328,39 @@ impl Broker {
             });
         }
         Ok(())
+    }
+
+    /// Apply a frame's dirty rectangles to the client's surface and encode the
+    /// result.
+    ///
+    /// `None` means "cannot compose this frame" — no surface yet and no
+    /// keyframe to seed one from, a non-JPEG region codec, or a rectangle that
+    /// does not match its payload. The caller then stores the region blob as
+    /// `.raw` rather than pretending it is an image.
+    fn compose_frame(store: &ClientStore, frame: &PendingFrame) -> Option<bytes::Bytes> {
+        if frame.codec_id != RDPGFX_CODECID_JPEG {
+            warn!(
+                codec = codec_name(frame.codec_id),
+                "region codec cannot be composed; storing the blob"
+            );
+            return None;
+        }
+        let mut guard = store.canvas.lock().unwrap();
+        let canvas = guard.as_mut()?;
+        for (rect, data) in &frame.rects {
+            if let Err(e) = canvas.apply_region(rect.left, rect.top, rect.right, rect.bottom, data)
+            {
+                warn!("region refused: {e}");
+                return None;
+            }
+        }
+        match canvas.encode_jpeg(COMPOSED_JPEG_QUALITY) {
+            Ok(jpeg) => Some(bytes::Bytes::from(jpeg)),
+            Err(e) => {
+                warn!("compose encode failed: {e}");
+                None
+            }
+        }
     }
 
     /// PCAUDIO payload: `[u16 header_len][json {token}][opus bytes]`.
@@ -357,13 +409,70 @@ impl Broker {
     }
 }
 
+/// Quality of the composed archive frame.
+const COMPOSED_JPEG_QUALITY: u8 = 85;
+
+/// Compose a dirty-rect frame, seeding the surface from the previous capture's
+/// archived image the first time a client sends rectangles.
+///
+/// Seeding from the *previous* capture (rather than decoding every full frame
+/// up front) means a client that only ever sends full frames never pays for a
+/// decode at all: the surface is built the moment it is needed.
+fn compose_dirty_rects(
+    store: &ClientStore,
+    client_id: &str,
+    frame: &PendingFrame,
+) -> Option<bytes::Bytes> {
+    if store.canvas.lock().unwrap().is_none() {
+        match canvas_from_last_capture(store, client_id) {
+            Some(canvas) => {
+                *store.canvas.lock().unwrap() = Some(canvas);
+                debug!(client_id, "surface seeded from the previous capture");
+            }
+            None => {
+                warn!(
+                    client_id,
+                    "dirty rects before any full frame; storing the region blob"
+                );
+                return None;
+            }
+        }
+    }
+    Broker::compose_frame(store, frame)
+}
+
+/// Decode the desktop as of the previous archived capture.
+fn canvas_from_last_capture(
+    store: &ClientStore,
+    client_id: &str,
+) -> Option<crate::canvas::Canvas> {
+    let entry = store.ukg.timeline(None, 1).ok()?.into_iter().next()?;
+    let token = store.ukg.image_token(entry.id).ok()??;
+    let rel = ObjectStore::key_path(
+        client_id,
+        filetime_to_ymd(entry.timestamp_100ns),
+        &token,
+        "jpg",
+    );
+    if !store.objects.exists(&rel) {
+        return None;
+    }
+    let bytes = store.objects.get(client_id, &rel, &token).ok()?;
+    crate::canvas::Canvas::from_jpeg(&bytes).ok()
+}
+
 /// One finished frame awaiting its metadata record.
 struct PendingFrame {
     codec_id: u16,
+    /// The wire payload: the codec's own stream for a single region, or the
+    /// `[l,t,r,b,len][data]…` concatenation for several.
     data: bytes::Bytes,
     /// 1 = the payload *is* the codec's stream (a JPEG, typically);
     /// >1 = concatenated region payloads, which no image decoder accepts.
     regions: usize,
+    /// The rectangles and their payloads, when this frame is a dirty-rect
+    /// update — what the compositor needs.
+    rects: Vec<(Rect, bytes::Bytes)>,
 }
 
 /// Accumulates START/W2S*/END state.
@@ -388,8 +497,8 @@ impl FrameAssembler {
         }
     }
     /// Single-JPEG-region frames (snapshot mode) yield the JPEG verbatim;
-    /// multi-region frames yield the concatenated region payloads — decoding
-    /// non-JPEG codecs is a later concern.
+    /// multi-region frames yield their rectangles separately (plus the legacy
+    /// concatenation, for callers that cannot compose).
     ///
     /// The region count travels with the payload because it decides how the
     /// object may be labelled: the concatenation is **not** a JPEG, whatever
@@ -400,6 +509,11 @@ impl FrameAssembler {
         }
         self.current_id = None;
         let regions_seen = self.regions.len();
+        let rects: Vec<(Rect, bytes::Bytes)> = self
+            .regions
+            .iter()
+            .map(|(_, r, d)| (*r, d.clone()))
+            .collect();
         let (codec_id, data) = if self.regions.len() == 1 {
             let (c, _, d) = self.regions.pop().unwrap();
             (c, d)
@@ -421,6 +535,7 @@ impl FrameAssembler {
             codec_id,
             data,
             regions: regions_seen,
+            rects,
         })
     }
 }

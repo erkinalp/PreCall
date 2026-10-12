@@ -185,6 +185,103 @@ async fn end_to_end(dir: &std::path::Path, frames: usize, width: u32, height: u3
     frames as f64 / total.as_secs_f64()
 }
 
+/// Solid-colour JPEG of exactly `w x h`, i.e. one dirty rectangle's payload.
+fn rect_jpeg(w: u32, h: u32, rgb: [u8; 3]) -> Vec<u8> {
+    let img = image::RgbImage::from_pixel(w, h, image::Rgb(rgb));
+    let mut out = Vec::new();
+    let enc = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, 85);
+    image::ImageEncoder::write_image(enc, img.as_raw(), w, h, image::ExtendedColorType::Rgb8)
+        .unwrap();
+    out
+}
+
+/// Dirty-rect scenario: one full keyframe, then `frames` captures each carrying
+/// two small rectangles. This prices the server's compose step — a memcpy per
+/// rectangle plus **one full-canvas encode per stored capture** — which is what
+/// decides how fast a client may send rectangles.
+async fn dirty_rect_throughput(
+    dir: &std::path::Path,
+    frames: usize,
+    width: u32,
+    height: u32,
+) -> f64 {
+    let (certs, key, fingerprint) = test_cert();
+    let tls_cfg = tls::server_config_from(certs, key).unwrap();
+    let broker = Arc::new(Broker::new(config(dir, true), tls_cfg).unwrap());
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr: SocketAddr = listener.local_addr().unwrap();
+    let b = Arc::clone(&broker);
+    let handle = tokio::spawn(async move { b.run_on(listener).await });
+
+    let client_id = Uuid::new_v4();
+    let tls = pinned_client_config(&fingerprint).unwrap();
+    let mut session = Session::connect(
+        addr,
+        "localhost",
+        tls,
+        AuthMethod::Psk { token: PSK.to_string() },
+        client_id,
+        "DIRTYBENCH",
+    )
+    .await
+    .expect("handshake");
+
+    // Keyframe: the whole desktop.
+    let keyframe = SyntheticFrame {
+        jpeg: rect_jpeg(width, height, [240, 240, 240]),
+        meta: sample_meta(0, "key-0"),
+    };
+    session.send_capture(&keyframe).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // Two plausible update rectangles (a text edit and a scroll band).
+    let patches = [
+        (precall_proto::Rect::new(100, 100, 300, 200), rect_jpeg(200, 100, [10, 20, 30])),
+        (precall_proto::Rect::new(0, 400, 1920, 460), rect_jpeg(1920, 60, [200, 10, 10])),
+    ];
+    let payload: usize = patches.iter().map(|(_, j)| j.len()).sum();
+
+    let t0 = Instant::now();
+    for i in 0..frames {
+        let meta = sample_meta(i as u64 + 1, &format!("dirty-{i}"));
+        session.send_dirty_regions(&patches, &meta).await.unwrap();
+    }
+    let send = t0.elapsed();
+
+    let ukg_path = dir.join(client_id.to_string()).join("ukg.db");
+    let deadline = Instant::now() + Duration::from_secs(300);
+    while Instant::now() < deadline {
+        let landed = Ukg::open(&ukg_path)
+            .ok()
+            .and_then(|ukg| ukg.timeline(None, (frames + 8) as i64).ok())
+            .map(|t| t.len())
+            .unwrap_or(0);
+        if landed > frames {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let total = t0.elapsed();
+    handle.abort();
+
+    println!(
+        "  dirty-rect    {frames} captures, 2 rects each ({} KiB/frame on the wire): send {:>7.2} ms ({:>6.0} fps) | composed+committed {:>7.2} ms ({:>5.1} fps, {:>5.1} ms/capture)",
+        payload / 1024,
+        send.as_secs_f64() * 1000.0,
+        frames as f64 / send.as_secs_f64(),
+        total.as_secs_f64() * 1000.0,
+        frames as f64 / total.as_secs_f64(),
+        total.as_secs_f64() * 1000.0 / frames as f64,
+    );
+    println!(
+        "                wire is {:.1} KiB/capture vs {:.0} KiB for a full frame ({:.0}x less), but each capture pays one {width}x{height} canvas encode",
+        payload as f64 / 1024.0,
+        (width as f64 * height as f64 / 8.0) / 1024.0,
+        ((width as f64 * height as f64 / 8.0) / 1024.0) / (payload as f64 / 1024.0),
+    );
+    frames as f64 / total.as_secs_f64()
+}
+
 #[tokio::main(flavor = "multi_thread", worker_threads = 4)]
 async fn main() {
     tracing_subscriber::fmt()
@@ -208,6 +305,12 @@ async fn main() {
 
     let dir3 = tempfile::tempdir().unwrap();
     let plain = end_to_end(dir3.path(), frames, width, height, false).await;
+
+    let dir4 = tempfile::tempdir().unwrap();
+    let dirty = dirty_rect_throughput(dir4.path(), frames, width, height).await;
+    println!(
+        "\ndirty-rect ingest {dirty:.1} captures/s vs {encrypted:.0} for full frames — the wire shrinks by the changed-area ratio,\n         the canvas encode is the new per-capture cost (see precall-broker/src/canvas.rs)."
+    );
 
     println!(
         "\nsummary: encrypted {encrypted:.0} fps vs plaintext {plain:.0} fps \

@@ -15,21 +15,32 @@ use windows::Win32::Graphics::Direct3D11::{
 use windows::Win32::Graphics::Dxgi::Common::{
     DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC,
 };
+use windows::Win32::Foundation::RECT;
 use windows::Win32::Graphics::Dxgi::{
     CreateDXGIFactory1, IDXGIAdapter1, IDXGIFactory1, IDXGIOutput1,
     IDXGIOutputDuplication, IDXGIResource, DXGI_ERROR_WAIT_TIMEOUT, DXGI_OUTDUPL_FRAME_INFO,
+    DXGI_OUTDUPL_MOVE_RECT,
 };
 use windows::Win32::Graphics::Direct3D::{D3D_DRIVER_TYPE_HARDWARE, D3D_FEATURE_LEVEL_11_0};
+
+/// `sizeof(RECT)` on the wire — the metadata buffers are arrays of these.
+const RECT_SIZE: usize = std::mem::size_of::<RECT>();
 
 /// A desktop frame straight off the GPU: tightly-packed BGRA + metadata.
 pub struct CaptureFrame {
     pub bgra: Vec<u8>,
     pub width: u32,
     pub height: u32,
-    /// `DXGI_OUTDUPL_FRAME_INFO::TotalMetadataBufferSize` — the size of the
-    /// *pointer* metadata for this frame, **not** a dirty-rect count and not a
-    /// change signal. Kept for diagnostics only; content changes are detected
-    /// by fingerprinting the pixels.
+    /// Rectangles DXGI says changed for this frame, in desktop coordinates.
+    ///
+    /// `None` means the metadata could not be read; the caller must treat that
+    /// as "send the whole frame", never as "nothing changed" — silently
+    /// treating it as unchanged would stop capture.
+    pub dirty: Option<Vec<precall_frame::Rect>>,
+    /// DXGI reported *move* rectangles: the desktop scrolled. The wire has no
+    /// surface-copy operation, so the caller sends a keyframe instead.
+    pub moved: bool,
+    /// Size of the frame's metadata buffer, for diagnostics.
     pub metadata_bytes: u32,
 }
 
@@ -124,6 +135,60 @@ impl Duplicator {
     }
     pub fn height(&self) -> u32 {
         self.height
+    }
+
+    /// Read the frame's dirty and move rectangles.
+    ///
+    /// Returns `(None, _)` when the metadata cannot be read, which the caller
+    /// must not confuse with "the desktop did not change".
+    #[allow(clippy::borrowed_box)]
+    fn read_metadata(
+        dup: &IDXGIOutputDuplication,
+        info: &DXGI_OUTDUPL_FRAME_INFO,
+    ) -> (Option<Vec<precall_frame::Rect>>, bool) {
+        let capacity = info.TotalMetadataBufferSize.max(RECT_SIZE as u32 * 4) as usize;
+        unsafe {
+            // Dirty rectangles: the changed pixels, which are what we send.
+            let mut dirty_buf = vec![0u8; capacity];
+            let mut dirty_bytes = 0u32;
+            let dirty_ok = dup
+                .GetFrameDirtyRects(
+                    dirty_buf.len() as u32,
+                    dirty_buf.as_mut_ptr() as *mut RECT,
+                    &mut dirty_bytes,
+                )
+                .is_ok();
+            if !dirty_ok {
+                return (None, false);
+            }
+            let count = (dirty_bytes as usize) / RECT_SIZE;
+            let mut rects = Vec::with_capacity(count);
+            for r in std::slice::from_raw_parts(dirty_buf.as_ptr() as *const RECT, count) {
+                rects.push(precall_frame::Rect::new(
+                    r.left as i16,
+                    r.top as i16,
+                    r.right as i16,
+                    r.bottom as i16,
+                ));
+            }
+
+            // Move rectangles: content copied within the surface. The protocol
+            // has no copy operation, so any move makes this a keyframe.
+            let mut move_buf = vec![0u8; capacity];
+            let mut move_bytes = 0u32;
+            let moved = match dup.GetFrameMoveRects(
+                move_buf.len() as u32,
+                move_buf.as_mut_ptr() as *mut DXGI_OUTDUPL_MOVE_RECT,
+                &mut move_bytes,
+            ) {
+                Ok(()) => move_bytes > 0,
+                // Unreadable move metadata is treated as "there was a move":
+                // a spurious keyframe costs bandwidth, a missed one costs
+                // correctness.
+                Err(_) => true,
+            };
+            (Some(rects), moved)
+        }
     }
 
     /// Wait up to `timeout_ms` for a new frame. `Ok(None)` = timeout (desktop

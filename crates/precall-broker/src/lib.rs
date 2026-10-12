@@ -7,6 +7,7 @@
 //! → object storage, `PCCTRL` heartbeats/commands.
 
 mod auth;
+pub mod canvas;
 mod config;
 mod ingest;
 pub mod tls;

@@ -1390,6 +1390,7 @@ dependencies = [
  "chrono",
  "clap",
  "futures-util",
+ "image",
  "precall-mock",
  "precall-proto",
  "precall-store",

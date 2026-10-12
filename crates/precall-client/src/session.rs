@@ -110,6 +110,55 @@ impl Connection {
 
     /// One RDPGFX frame on GFXRDP: START → W2S_1(JPEG) → END → ACK.
     /// Layout identical to MS-RDPEGFX; the client assigns the frame id.
+    /// Send a **dirty-rect** frame: one START/END pair carrying only the
+    /// rectangles that changed.
+    ///
+    /// This is the reason full framerate is affordable at all — the wire cost
+    /// is proportional to the changed area, not to the screen — and it is the
+    /// shape RDPEGFX itself uses (`WIRE_TO_SURFACE` per rectangle, applied by
+    /// the server to its surface; see `precall-broker/src/canvas.rs`).
+    pub async fn send_regions(
+        &mut self,
+        regions: &[(precall_frame::Rect, Vec<u8>)],
+        timestamp_100ns: u64,
+    ) -> Result<(), ClientError> {
+        self.frame_id += 1;
+        let fid = self.frame_id;
+        let mut out = BytesMut::new();
+        out.extend_from_slice(&RDPGFX_CMDID_START_FRAME.to_le_bytes());
+        out.extend_from_slice(&0u32.to_le_bytes());
+        out.extend_from_slice(&12u32.to_le_bytes());
+        out.extend_from_slice(&fid.to_le_bytes());
+        out.extend_from_slice(&timestamp_100ns.to_le_bytes());
+        for (rect, jpeg) in regions {
+            let bl = jpeg.len() as u32;
+            let pdu_len = 8 + 2 + 2 + 1 + 8 + 4 + bl;
+            out.extend_from_slice(&RDPGFX_CMDID_WIRETOSURFACE_1.to_le_bytes());
+            out.extend_from_slice(&0u16.to_le_bytes());
+            out.extend_from_slice(&pdu_len.to_le_bytes());
+            out.extend_from_slice(&(self.surface_id as u32).to_le_bytes()[..2]);
+            out.extend_from_slice(&RDPGFX_CODECID_JPEG.to_le_bytes());
+            out.extend_from_slice(&[RDPGFX_PIXEL_FORMAT_XRGB_8888]);
+            out.extend_from_slice(&(rect.left as i32).to_le_bytes());
+            out.extend_from_slice(&(rect.top as i32).to_le_bytes());
+            out.extend_from_slice(&(rect.right as i32).to_le_bytes());
+            out.extend_from_slice(&(rect.bottom as i32).to_le_bytes());
+            out.extend_from_slice(&bl.to_le_bytes());
+            out.extend_from_slice(jpeg);
+        }
+        out.extend_from_slice(&RDPGFX_CMDID_END_FRAME.to_le_bytes());
+        out.extend_from_slice(&0u32.to_le_bytes());
+        out.extend_from_slice(&8u32.to_le_bytes());
+        out.extend_from_slice(&fid.to_le_bytes());
+        out.extend_from_slice(&RDPGFX_CMDID_FRAMEACKNOWLEDGE.to_le_bytes());
+        out.extend_from_slice(&0u32.to_le_bytes());
+        out.extend_from_slice(&20u32.to_le_bytes());
+        out.extend_from_slice(&0u32.to_le_bytes());
+        out.extend_from_slice(&fid.to_le_bytes());
+        out.extend_from_slice(&1u32.to_le_bytes());
+        self.send_mux(ChannelId::GfxRdp, out).await
+    }
+
     pub async fn send_frame(
         &mut self,
         jpeg: &[u8],

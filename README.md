@@ -165,13 +165,41 @@ link, then the encoder:
 
 That is the honest reason Recall collects a capture every few seconds instead of
 streaming: a client-server design at full framerate is bounded by the *uplink*
-(and by the encoder's CPU), not by the datacenter. The lever that changes both
-numbers is to send only what changed — RDPGFX `WIRE_TO_SURFACE` carries a
-destination rectangle per region and the broker already assembles multi-region
-frames, but the client does not yet compute dirty rectangles (DXGI
-`GetFrameDirtyRects`) and the broker does not composite regions into the stored
-desktop image (a multi-region frame is stored as a `.raw` region blob and
-reported as such, never as a corrupt `.jpg`).
+(and by the encoder's CPU), not by the datacenter.
+
+### Dirty rectangles, and why the server composes them
+
+The lever is to send only what changed. The client takes DXGI's dirty
+rectangles, plans a delta (`precall_frame::plan_capture` — scrolling and
+oversized changes fall back to a keyframe, since the wire has no surface-copy
+operation), encodes each rectangle on its own and sends them as
+`WIRE_TO_SURFACE` PDUs inside one frame. The broker applies them to a per-client
+**desktop surface** and archives the composed result as an ordinary full-frame
+JPEG (`precall-broker/src/canvas.rs`).
+
+That choice is deliberate: it keeps the reader-facing contract — `ukg.db` plus
+one image per capture, Recall's own layout — so the snapshot route, Click-to-Do,
+the image embedder, the export and any migration to or from Recall keep working
+without a compositor. It is also what the RDP graphics pipeline does
+(`WIRE_TO_SURFACE` applies bitmaps to a *surface* the server owns). Storing
+deltas would have been cheaper to ingest and worse everywhere else.
+
+Measured, same harness, two rectangles per capture (5.1 KiB on the wire instead
+of 253 KiB — **50x less**):
+
+| path | wire per capture | server per capture | client per capture |
+|---|---|---|---|
+| full frames | 253 KiB | ~0.7 ms (stored verbatim) | 58 ms encode |
+| dirty rects | 5.1 KiB | **45.3 ms** (canvas compose + encode) | ~2 ms encode |
+
+So dirty rectangles move the encode from the client to the server. At Recall's
+cadence that is 45 ms per three seconds — **1.5% of one core per client** — while
+the client drops from 58 ms to a couple of milliseconds and the uplink from
+253 KiB to 5 KiB. At a 60 fps *stream* the server pays ~2.7 cores per client,
+which is the case for a hardware encoder (Media Foundation on Windows; the
+measured figure is the software JPEG path). The knob that decides it is the
+capture cadence: `16` ms is streaming, `3000` ms is Recall, and the server's
+cost per capture does not change.
 
 Two invariants keep a client honest at *both* operating points, and both are
 enforced by `precall-frame` and tested:
