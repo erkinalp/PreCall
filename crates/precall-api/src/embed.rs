@@ -85,7 +85,10 @@ impl Embedder {
                 r.json::<Resp>().await.ok().map(|r| r.embedding)
             }
             Embedder::Local => {
-                // Content-hash embedding for image bytes.
+                // Content-hash embedding for image bytes. Must be `EMBED_DIM`
+                // wide and L2-normalised, because it is written straight into
+                // a `dim`-wide `si_*` store; the Python fallback
+                // (`hash_embedding_bytes`) is the reference implementation.
                 let mut acc = [0u8; 32];
                 for chunk in jpeg.chunks(32) {
                     let h = Sha256::digest(chunk);
@@ -93,10 +96,50 @@ impl Embedder {
                         *a = a.wrapping_add(*b);
                     }
                 }
-                Some(acc.iter().map(|&b| (b as f32 / 255.0) - 0.5).collect())
+                let mut v: Vec<f32> = (0..EMBED_DIM)
+                    .map(|i| (acc[i % acc.len()] as f32 / 255.0) - 0.5)
+                    .collect();
+                let n = v.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-6);
+                for x in v.iter_mut() {
+                    *x /= n;
+                }
+                Some(v)
             }
             Embedder::Disabled => None,
         }
+    }
+
+    /// Text → **image space** embedding.
+    ///
+    /// Only the AI service can produce this: it needs the same CLIP stack that
+    /// encoded the stored screenshots. The service answers `501` when its image
+    /// backend is the deterministic hash fallback, because hashed text and
+    /// hashed pixels live in different spaces — searching one with the other
+    /// returns noise, not "no matches". `None` therefore means *this
+    /// deployment cannot answer text queries against the image store* and
+    /// callers must report the leg as skipped.
+    pub async fn embed_image_text(&self, text: &str) -> Option<Vec<f32>> {
+        let Embedder::Http { base, client } = self else {
+            return None;
+        };
+        #[derive(serde::Serialize)]
+        struct Req<'a> {
+            text: &'a str,
+        }
+        #[derive(serde::Deserialize)]
+        struct Resp {
+            embedding: Vec<f32>,
+        }
+        let r = client
+            .post(format!("{base}/embed/image-text"))
+            .json(&Req { text })
+            .send()
+            .await
+            .ok()?;
+        if !r.status().is_success() {
+            return None;
+        }
+        r.json::<Resp>().await.ok().map(|x| x.embedding)
     }
 
     /// Topic extraction via AI service (returns [] when unavailable).
@@ -163,5 +206,19 @@ mod tests {
         assert_eq!(a, b);
         let n: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
         assert!((n - 1.0).abs() < 1e-3);
+    }
+
+    /// The image embedding is written straight into a `dim`-wide `si_*` store,
+    /// so it must be `EMBED_DIM` long and normalised — and distinct images must
+    /// not collide.
+    #[tokio::test]
+    async fn local_image_embedding_fits_the_store() {
+        let e = Embedder::Local;
+        let a = e.embed_image(b"\xff\xd8scene-a\xff\xd9").await.unwrap();
+        let b = e.embed_image(b"\xff\xd8scene-b\xff\xd9").await.unwrap();
+        assert_eq!(a.len(), EMBED_DIM);
+        let n: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
+        assert!((n - 1.0).abs() < 1e-3, "not normalised: {n}");
+        assert_ne!(a, b);
     }
 }

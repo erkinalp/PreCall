@@ -60,7 +60,7 @@ server control channel.
 
 ```
 GET  /timeline?client&before&limit     Recall-style paged timeline
-POST /search                           {query, mode: fts|semantic|hybrid, app_filter, time_range}
+POST /search                           {query, mode: fts|semantic|hybrid|image, image, app_filter, time_range}
 GET  /snapshot/{id}?client             decrypted JPEG snapshot
 GET  /regions/{id}?client              OCR regions (Click-to-Do data)
 POST /relaunch                         {window_capture_id} → activation_uri / fallback_uri
@@ -71,6 +71,23 @@ DELETE /client/{id}/data               right-to-erasure wipe
 WS   /live?client                      live capture feed
 GET  /health
 ```
+
+Search answers with `{results, legs}` and, when a leg could not run, a
+`notes` array naming it — a missing capability is reported, never silently
+returned as "no matches". The legs are:
+
+| leg | runs when | needs |
+|---|---|---|
+| `fts` | `mode` is `hybrid`/`fts` | nothing |
+| `text-semantic` | `mode` is `hybrid`/`semantic` | `ukg.db` OCR text + either embedder |
+| `image-semantic` | `image` (base64 JPEG or data URL) is supplied | screenshots embedded into `SemanticImageStore.db` |
+| `image-text` | `mode` is `hybrid`/`semantic` and the AI service has CLIP | `ai-cpu`/`ai-cuda` extra (`/embed/image-text`) |
+
+Results are ranked by relevance (`relevance_score`), with recency only as a
+tie-break. `/embed/image-text` deliberately answers **501** when no CLIP stack
+is installed: the deterministic hash fallback has no shared text/image space,
+so answering with a hash embedding would turn text→image search into an
+arbitrary ranker.
 
 ## Repo layout
 

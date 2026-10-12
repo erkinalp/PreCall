@@ -3,7 +3,7 @@
 //!
 //! ```text
 //! GET    /api/v1/timeline?client=&before=&limit=    paginated timeline
-//! POST   /api/v1/search                              FTS5 + semantic hybrid
+//! POST   /api/v1/search                              FTS5 + text/image semantic
 //! GET    /api/v1/snapshot/{id}?client=               screenshot (decrypted)
 //! GET    /api/v1/regions/{id}?client=                OCR regions (Click-to-Do)
 //! POST   /api/v1/relaunch                            {id} → activation_uri

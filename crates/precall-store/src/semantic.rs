@@ -147,6 +147,24 @@ impl SemanticIndex {
         Ok(self.conn.query_row("SELECT COUNT(*) FROM \"si_diskann_graph\"", [], |r| r.get(0))?)
     }
 
+    /// Is `item_id` already present in `si_items`?
+    ///
+    /// Enrichment uses this as an idempotency guard: a pass that inserted an
+    /// embedding and then died before marking the capture processed must not
+    /// append a second graph row on the next pass. `si_items` is keyed by the
+    /// item id, so the lookup is a primary-key probe.
+    pub fn has_item(&self, item_id: &[u8]) -> Result<bool, SemanticError> {
+        if item_id.len() != 16 {
+            return Err(SemanticError::BadItemId);
+        }
+        let n: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM \"si_items\" WHERE \"id\" = ?",
+            params![item_id],
+            |r| r.get(0),
+        )?;
+        Ok(n > 0)
+    }
+
     /// Decode a `si_items` id back to a `WindowCapture` id (inverse of
     /// [`SemanticIndex::item_id_for_capture`]).
     pub fn capture_id_for_item(item_id: &[u8]) -> Option<i64> {

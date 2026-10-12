@@ -139,12 +139,28 @@ fn semantic_index_round_trip() {
 }
 
 #[test]
+fn semantic_has_item_is_the_idempotency_guard() {
+    let idx = SemanticIndex::open_in_memory(4, "image").unwrap();
+    let item = SemanticIndex::item_id_for_capture(7);
+    assert!(!idx.has_item(&item).unwrap());
+    idx.insert(&item, None, None, &[0.5, 0.5, 0.5, 0.5]).unwrap();
+    assert!(idx.has_item(&item).unwrap());
+    // A restart that re-runs the pass sees the item and skips the insert.
+    assert_eq!(idx.count().unwrap(), 1);
+    // Length is validated the same way insert() validates it.
+    assert!(idx.has_item(&[0u8; 8]).is_err());
+}
+
+#[test]
 fn object_store_encrypted_round_trip() {
     let dir = tempfile::tempdir().unwrap();
     let store = ObjectStore::encrypted(dir.path(), EnvelopeCipher::generate_key()).unwrap();
     let rel = store
         .put_image("client-1", (2026, 9, 15), "tok-9", b"\xFF\xD8jpeg")
         .unwrap();
+    // Readers (snapshot route, enrichment) rebuild the key with key_path;
+    // it must match what put() wrote, byte for byte.
+    assert_eq!(rel, ObjectStore::key_path("client-1", (2026, 9, 15), "tok-9", "jpg"));
     // On-disk bytes are ciphertext (not raw jpeg).
     let on_disk = std::fs::read(store.abs_path(&rel)).unwrap();
     assert_ne!(on_disk, b"\xFF\xD8jpeg");
