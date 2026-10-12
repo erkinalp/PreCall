@@ -10,6 +10,7 @@ use precall_proto::metadata::{CaptureBatch, ControlMessage, WindowCaptureRecord}
 use precall_proto::{
     read_limited_json, write_limited_json, AuthMethod, Capabilities, ChannelId, ClientHello,
     DisplayInfo, MuxCodec, MuxFrame, ServerHello, ServerReject, PROTOCOL_VERSION,
+    RDPGFX_CODECID_JPEG,
 };
 use std::net::SocketAddr;
 use tokio::net::TcpStream;
