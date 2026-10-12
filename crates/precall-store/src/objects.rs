@@ -59,7 +59,11 @@ impl ObjectStore {
     }
 
     /// `{client}/{y}/{m}/{d}/{token}.{ext}` — `date` is `(year, month, day)`.
-    fn key_path(client_id: &str, date: (i32, u32, u32), token: &str, ext: &str) -> PathBuf {
+    ///
+    /// Public because readers (the API's snapshot route and the enrichment
+    /// worker) must reconstruct the same key that [`ObjectStore::put`] wrote;
+    /// hand-rolling the layout in a caller is how reader and writer drift.
+    pub fn key_path(client_id: &str, date: (i32, u32, u32), token: &str, ext: &str) -> PathBuf {
         // Sanitize path components — tokens come off the wire.
         let clean = |s: &str| -> String {
             s.chars().filter(|c| c.is_alphanumeric() || matches!(c, '-' | '_' | '.')).collect()

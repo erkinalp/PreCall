@@ -67,6 +67,7 @@ async fn main() -> anyhow::Result<()> {
             embedder,
             cli.embedding_dim,
             std::time::Duration::from_secs(5),
+            object_key,
         );
     }
 

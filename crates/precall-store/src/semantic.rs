@@ -11,9 +11,15 @@
 //! DiskANN index can be grafted on without a schema migration.
 
 use crate::schema::SI_SCHEMA;
-use rusqlite::{params, Connection};
+
+use rusqlite::{params, Connection, OptionalExtension};
 use std::path::Path;
 use thiserror::Error;
+
+/// Placeholder stamped into a store that has been created but not yet filled
+/// by a successful embedding. It is not a real space: callers must treat it as
+/// "unknown", never as a mismatch.
+pub const SPACE_UNKNOWN: &str = "unknown";
 
 #[derive(Debug, Error)]
 pub enum SemanticError {
@@ -74,6 +80,50 @@ impl SemanticIndex {
         Ok(())
     }
 
+    /// Which embedding space this store was built with (a model/backend
+    /// identifier), or `None` if it has never been stamped.
+    ///
+    /// Vectors from different models are not comparable even at the same
+    /// dimension, so callers must compare this against the space of the
+    /// embedder they are querying with before trusting any row in here.
+    pub fn space_id(&self) -> Result<Option<String>, SemanticError> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT \"vector_space_id\" FROM \"si_diskann_info\" ORDER BY \"id\" LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .optional()?)
+    }
+
+    /// Stamp the store with the embedding space now in use.
+    pub fn set_space_id(&self, space_id: &str) -> Result<(), SemanticError> {
+        let n = self.conn.execute(
+            "UPDATE \"si_diskann_info\" SET \"vector_space_id\" = ?",
+            params![space_id],
+        )?;
+        if n == 0 {
+            self.ensure_info(space_id)?;
+            self.conn.execute(
+                "UPDATE \"si_diskann_info\" SET \"vector_space_id\" = ?",
+                params![space_id],
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Delete every embedding. Used when the embedder identity changes: rows
+    /// built by the previous model are not comparable with new queries.
+    pub fn clear(&self) -> Result<(), SemanticError> {
+        self.conn.execute_batch(
+            "DELETE FROM \"si_embedding_metadata\";
+             DELETE FROM \"si_diskann_graph\";
+             DELETE FROM \"si_items\";",
+        )?;
+        Ok(())
+    }
+
     /// Deterministic `si_items` id for a `WindowCapture` row — id in the low
     /// bytes of a 16-byte buffer, matching Recall's blob-keyed items.
     pub fn item_id_for_capture(capture_id: i64) -> Vec<u8> {
@@ -98,24 +148,41 @@ impl SemanticIndex {
             return Err(SemanticError::BadItemId);
         }
         let blob = f32s_to_bytes(embedding);
-        self.conn.execute("INSERT OR IGNORE INTO \"si_items\" (\"id\") VALUES (?)", params![item_id])?;
-        self.conn.execute(
+        // All three rows or none: a torn insert (item row present, graph row
+        // missing) would make `has_item` claim an embedding that no search can
+        // ever return.
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute("INSERT OR IGNORE INTO \"si_items\" (\"id\") VALUES (?)", params![item_id])?;
+        tx.execute(
             "INSERT INTO \"si_diskann_graph\" (\"embedding\",\"outbound_ids\") VALUES (?, '')",
             params![blob],
         )?;
-        let graph_id = self.conn.last_insert_rowid();
-        self.conn.execute(
+        let graph_id = tx.last_insert_rowid();
+        tx.execute(
             "INSERT INTO \"si_embedding_metadata\" (\"embedding_id\",\"item_id\",\"region_id\",\"metadata_json\")
              VALUES (?,?,?,?)",
             params![graph_id, item_id, region_id, metadata_json],
         )?;
+        tx.commit()?;
         Ok(graph_id)
     }
 
     /// Flat cosine search — returns the `k` nearest items, best first.
-    pub fn search(&self, query: &[f32], k: usize) -> Result<Vec<EmbeddingHit>, SemanticError> {
+    ///
+    /// `allowed`, when given, is applied **during** the scan: filtering a
+    /// truncated top-k afterwards would drop eligible matches that rank below
+    /// the cut, which is exactly what a filtered image search used to do.
+    pub fn search(
+        &self,
+        query: &[f32],
+        k: usize,
+        allowed: Option<&std::collections::HashSet<i64>>,
+    ) -> Result<Vec<EmbeddingHit>, SemanticError> {
         if query.len() != self.dim {
             return Err(SemanticError::DimMismatch { expected: self.dim, got: query.len() });
+        }
+        if allowed.is_some_and(|a| a.is_empty()) {
+            return Ok(Vec::new());
         }
         let mut stmt = self.conn.prepare(
             "SELECT g.\"id\", g.\"embedding\", m.\"item_id\", m.\"region_id\"
@@ -126,6 +193,13 @@ impl SemanticIndex {
         let mut hits = Vec::new();
         let mut rows = stmt.query([])?;
         while let Some(row) = rows.next()? {
+            let item_id: Vec<u8> = row.get(2)?;
+            if let Some(allowed) = allowed {
+                match Self::capture_id_for_item(&item_id) {
+                    Some(cid) if allowed.contains(&cid) => {}
+                    _ => continue,
+                }
+            }
             let blob: Vec<u8> = row.get(1)?;
             let emb = bytes_to_f32s(&blob);
             if emb.len() != self.dim {
@@ -133,7 +207,7 @@ impl SemanticIndex {
             }
             let score = cosine(query, qnorm, &emb);
             hits.push(EmbeddingHit {
-                item_id: row.get(2)?,
+                item_id,
                 region_id: row.get(3)?,
                 score,
             });
@@ -145,6 +219,28 @@ impl SemanticIndex {
 
     pub fn count(&self) -> Result<i64, SemanticError> {
         Ok(self.conn.query_row("SELECT COUNT(*) FROM \"si_diskann_graph\"", [], |r| r.get(0))?)
+    }
+
+    /// Is `item_id` backed by a **searchable** embedding?
+    ///
+    /// Enrichment uses this as its idempotency guard: a pass that inserted an
+    /// embedding and then died before marking the capture processed must not
+    /// append a second graph row on the next pass. The check follows the same
+    /// join `search` uses, so a torn insert (item row without a graph row)
+    /// reports `false` and gets repaired instead of being trusted as done.
+    pub fn has_item(&self, item_id: &[u8]) -> Result<bool, SemanticError> {
+        if item_id.len() != 16 {
+            return Err(SemanticError::BadItemId);
+        }
+        let n: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM \"si_items\" i
+             JOIN \"si_embedding_metadata\" m ON m.\"item_id\" = i.\"id\"
+             JOIN \"si_diskann_graph\" g ON g.\"id\" = m.\"embedding_id\"
+             WHERE i.\"id\" = ?",
+            params![item_id],
+            |r| r.get(0),
+        )?;
+        Ok(n > 0)
     }
 
     /// Decode a `si_items` id back to a `WindowCapture` id (inverse of

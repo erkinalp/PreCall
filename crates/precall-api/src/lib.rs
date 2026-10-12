@@ -3,7 +3,7 @@
 //!
 //! ```text
 //! GET    /api/v1/timeline?client=&before=&limit=    paginated timeline
-//! POST   /api/v1/search                              FTS5 + semantic hybrid
+//! POST   /api/v1/search                              FTS5 + text/image semantic
 //! GET    /api/v1/snapshot/{id}?client=               screenshot (decrypted)
 //! GET    /api/v1/regions/{id}?client=                OCR regions (Click-to-Do)
 //! POST   /api/v1/relaunch                            {id} → activation_uri
@@ -21,7 +21,7 @@ mod embed;
 pub mod enrich;
 mod routes;
 
-pub use embed::{Embedder, EMBED_DIM};
+pub use embed::{EmbedOutcome, Embedder, EMBED_DIM, LOCAL_IMAGE_SPACE, LOCAL_TEXT_SPACE};
 pub use routes::{build_router, ApiState};
 
 use thiserror::Error;
@@ -44,6 +44,11 @@ pub enum ApiError {
     Unauthorized,
     #[error("not found: {0}")]
     NotFound(String),
+    /// A dependency this request cannot be served without is down (e.g. image
+    /// search without an answering AI service). Distinct from `BadRequest`:
+    /// the same request may succeed later.
+    #[error("unavailable: {0}")]
+    Unavailable(String),
     #[error("{0}")]
     Anyhow(#[from] anyhow::Error),
     #[error("upstream: {0}")]

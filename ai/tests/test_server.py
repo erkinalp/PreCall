@@ -11,7 +11,16 @@ import numpy as np
 import pytest
 from fastapi.testclient import TestClient
 
-from precall_ai.providers import hash_embedding, TopicExtractor
+from precall_ai.providers import (
+    DIM,
+    ImageEmbedder,
+    ImageTextEmbedder,
+    TextEmbedder,
+    hash_embedding,
+    normalize_device,
+    project_clip,
+    TopicExtractor,
+)
 from precall_ai.server import app
 
 
@@ -84,3 +93,97 @@ def test_embed_image(client: TestClient) -> None:
     assert r.status_code == 200
     emb = np.array(r.json()["embedding"])
     assert emb.shape == (384,)
+
+
+def test_health_reports_the_image_text_backend(client: TestClient) -> None:
+    body = client.get("/health").json()
+    assert body["image_text_backend"] in {"hash", "clip"}
+    assert body["image_backend"] in {"hash", "clip"}
+
+
+def test_image_text_is_refused_without_clip(client: TestClient) -> None:
+    """No CLIP stack ⇒ 501, never a hash embedding.
+
+    A hash "text embedding" does not share a space with the hashed pixels in
+    the image store, so answering 200 here would silently turn text→image
+    search into a random ranker. The Rust caller relies on the non-2xx status
+    to report the leg as skipped.
+    """
+    original = app.state.image_text_embedder
+    app.state.image_text_embedder = ImageTextEmbedder()  # hash-backed
+    try:
+        assert app.state.image_text_embedder.backend == "hash"
+        r = client.post("/embed/image-text", json={"text": "a red bicycle"})
+        assert r.status_code == 501, r.text
+        assert "CLIP" in r.json()["error"]
+    finally:
+        app.state.image_text_embedder = original
+
+
+def test_image_text_encoder_shares_the_image_checkpoint() -> None:
+    """One checkpoint for both towers — two different CLIP builds would not
+    share a space. Pinned here so a future refactor cannot load a second one."""
+    enc = ImageEmbedder()
+    ite = ImageTextEmbedder.from_encoder(enc)
+    assert ite.model is enc._model
+    assert ite.preprocess is enc._preprocess
+    assert ite.backend == enc.backend
+
+
+def test_project_clip_truncates_and_renormalises() -> None:
+    full = np.arange(512, dtype=np.float32) + 1.0
+    p = project_clip(full, DIM)
+    assert p.shape == (DIM,)
+    assert abs(float(np.linalg.norm(p)) - 1.0) < 1e-5
+    # Same transform for text and image features: cosine in the projected
+    # space equals cosine in the truncated subspace (documenting the loss).
+    other = (np.arange(512, dtype=np.float32) % 7) + 1.0
+    q = project_clip(other, DIM)
+    a, b = full[:DIM], other[:DIM]
+    expected = float(a @ b) / (float(np.linalg.norm(a)) * float(np.linalg.norm(b)))
+    assert abs(float(p @ q) - expected) < 1e-5
+    # Anything past `dim` is discarded — the projection is lossy by design.
+    tail_changed = full.copy()
+    tail_changed[DIM:] += 100.0
+    np.testing.assert_allclose(project_clip(tail_changed, DIM), p)
+
+
+def test_rocm_maps_onto_the_cuda_device_api() -> None:
+    """`rocm` is our extra's name, not a PyTorch device string.
+
+    PyTorch exposes ROCm through the CUDA API, so passing "rocm" through to
+    `.to(...)` raises and the encoder silently falls back to the hash backend
+    on exactly the hardware the ROCm extra exists for.
+    """
+    assert normalize_device("rocm") == "cuda"
+    assert normalize_device("cuda") == "cuda"
+    assert normalize_device("cpu") == "cpu"
+    assert normalize_device("mps") == "mps"
+    # Normalised before the model is loaded, so it survives the hash fallback.
+    assert TextEmbedder(device="rocm").device == "cuda"
+    assert ImageEmbedder(device="rocm").device == "cuda"
+    ite = ImageTextEmbedder.from_encoder(ImageEmbedder(device="rocm"))
+    assert ite.device == "cuda"
+
+
+def test_every_embedding_reports_its_vector_space(client: TestClient) -> None:
+    """Vectors from different encoders are incomparable, so the space travels
+    with the embedding and is stamped into the si_* stores."""
+    health = client.get("/health").json()
+    assert health["text_space_id"]
+    assert health["image_space_id"]
+    assert health["image_space_id"] != health["text_space_id"]
+
+    t = client.post("/embed/text", json={"text": "kerberos"}).json()
+    assert t["space"] == health["text_space_id"]
+    i = client.post(
+        "/embed/image", content=b"\xff\xd8\xff\xd9", headers={"content-type": "image/jpeg"}
+    ).json()
+    assert i["space"] == health["image_space_id"]
+
+
+def test_image_text_encoder_shares_the_image_space_id() -> None:
+    """This is what makes text→image search meaningful: one space, or none."""
+    enc = ImageEmbedder()
+    ite = ImageTextEmbedder.from_encoder(enc)
+    assert ite.space_id == enc.space_id

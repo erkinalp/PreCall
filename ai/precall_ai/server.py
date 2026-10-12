@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: GPL-2.0-only
-"""FastAPI service: /embed/text, /embed/image, /topics, /transcribe, /health.
+"""FastAPI service: /embed/text, /embed/image, /embed/image-text, /topics,
+/transcribe, /health.
 
 Run:  ``uv run uvicorn precall_ai.server:app --port 8090``
 Device selection: ``PRECALL_AI_DEVICE=cpu|cuda|rocm`` (default cpu) — or the
@@ -14,9 +15,17 @@ from contextlib import asynccontextmanager
 
 import numpy as np
 from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
-from .providers import DIM, ImageEmbedder, TextEmbedder, TopicExtractor
+from .providers import (
+    DIM,
+    ImageEmbedder,
+    ImageTextEmbedder,
+    ImageTextUnavailable,
+    TextEmbedder,
+    TopicExtractor,
+)
 
 
 @asynccontextmanager
@@ -24,6 +33,10 @@ async def lifespan(app: FastAPI):
     dev = _device()
     app.state.text_embedder = TextEmbedder(device=dev)
     app.state.image_embedder = ImageEmbedder(device=dev)
+    # Same checkpoint and preprocessing as the image encoder — see _load_clip.
+    app.state.image_text_embedder = ImageTextEmbedder.from_encoder(
+        app.state.image_embedder
+    )
     app.state.topics = TopicExtractor()
     yield
 
@@ -58,6 +71,9 @@ def health() -> dict:
         "status": "ok",
         "text_backend": app.state.text_embedder.backend,
         "image_backend": app.state.image_embedder.backend,
+        "image_text_backend": app.state.image_text_embedder.backend,
+        "text_space_id": app.state.text_embedder.space_id,
+        "image_space_id": app.state.image_embedder.space_id,
         "dim": DIM,
         "device": app.state.text_embedder.device,
     }
@@ -65,8 +81,9 @@ def health() -> dict:
 
 @app.post("/embed/text")
 def embed_text(req: EmbedTextReq) -> dict:
-    emb = _text_embedder().embed([req.text])[0]
-    return {"embedding": emb.tolist(), "dim": int(emb.shape[0])}
+    enc = _text_embedder()
+    emb = enc.embed([req.text])[0]
+    return {"embedding": emb.tolist(), "dim": int(emb.shape[0]), "space": enc.space_id}
 
 
 @app.post("/embed/text/batch")
@@ -81,7 +98,34 @@ async def embed_image(request: Request) -> dict:
     if not body:
         return {"embedding": [], "dim": DIM}
     emb = app.state.image_embedder.embed(body)
-    return {"embedding": emb.tolist(), "dim": int(emb.shape[0])}
+    return {
+        "embedding": emb.tolist(),
+        "dim": int(emb.shape[0]),
+        "space": app.state.image_embedder.space_id,
+    }
+
+
+@app.post("/embed/image-text")
+def embed_image_text(req: EmbedTextReq) -> dict:
+    """Text → image space, so a *text* query can search stored screenshots.
+
+    Answers 501 when no CLIP stack is installed. That is deliberate: without
+    CLIP there is no shared text/image space, and returning a hash embedding
+    would make the caller's text→image leg look implemented while ranking the
+    image store at random.
+    """
+    try:
+        emb = app.state.image_text_embedder.embed(req.text)
+    except ImageTextUnavailable as e:
+        return JSONResponse(
+            status_code=501,
+            content={"error": str(e), "image_text_backend": "hash"},
+        )
+    return {
+        "embedding": emb.tolist(),
+        "dim": int(emb.shape[0]),
+        "space": app.state.image_text_embedder.space_id,
+    }
 
 
 @app.post("/topics")

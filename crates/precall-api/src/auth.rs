@@ -98,6 +98,7 @@ impl From<ApiError> for StatusCode {
             ApiError::Unauthorized => StatusCode::UNAUTHORIZED,
             ApiError::NotFound(_) => StatusCode::NOT_FOUND,
             ApiError::BadRequest(_) => StatusCode::BAD_REQUEST,
+            ApiError::Unavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
             _ => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }

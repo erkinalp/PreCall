@@ -29,6 +29,7 @@ import numpy as np
 
 DIM = 384  # all-MiniLM-L6-v2 output size; si_* stores are provisioned for this
 _MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
+CLIP_MODEL_NAME = "openai/clip-vit-base-patch32"
 
 
 def _requested_device() -> str:
@@ -44,8 +45,7 @@ class TextEmbedder:
     def __post_init__(self) -> None:
         self._model = None
         self.backend = "hash"
-        if self.device in {"cuda", "rocm"}:
-            self.device = "cuda"
+        self.device = normalize_device(self.device)
         try:
             import torch  # noqa: F401
 
@@ -58,6 +58,22 @@ class TextEmbedder:
         except Exception:  # torch not installed / model unavailable offline
             self._model = None
             self.backend = "hash"
+
+    @property
+    def space_id(self) -> str:
+        """Identity of the vector space this encoder produces.
+
+        Vectors from different encoders are incomparable even at the same
+        dimension, so this travels with every embedding and is stamped into the
+        `si_*` stores: a deployment switching encoder must rebuild, not mix.
+        Note the Python hash and the Rust local hash are *different* functions,
+        hence different ids.
+        """
+        return (
+            f"st:{_MODEL_NAME}@{DIM}"
+            if self.backend == "sentence-transformers"
+            else f"hash:python-text@{DIM}"
+        )
 
     def embed(self, texts: list[str]) -> np.ndarray:
         if self._model is not None:
@@ -90,27 +106,23 @@ class ImageEmbedder:
     device: str = "cpu"
 
     def __post_init__(self) -> None:
-        self._model = None
-        self._preprocess = None
-        self.backend = "hash"
-        if self.device in {"cuda", "rocm"}:
-            self.device = "cuda"
-        try:
-            import torch
-            from transformers import CLIPModel, CLIPProcessor
-
-            if self.device == "cuda" and not torch.cuda.is_available():
-                self.device = "cpu"
-            self._model = CLIPModel.from_pretrained(
-                "openai/clip-vit-base-patch32"
-            ).to(self.device)
-            self._preprocess = CLIPProcessor.from_pretrained(
-                "openai/clip-vit-base-patch32"
-            )
-            self.backend = "clip"
-        except Exception:
+        self.device = normalize_device(self.device)
+        loaded = _load_clip(self.device)
+        if loaded is None:
             self._model = None
+            self._preprocess = None
             self.backend = "hash"
+        else:
+            self._model, self._preprocess, self.device = loaded
+            self.backend = "clip"
+
+    @property
+    def space_id(self) -> str:
+        return (
+            f"clip:{CLIP_MODEL_NAME}@{DIM}"
+            if self.backend == "clip"
+            else f"hash:python-image@{DIM}"
+        )
 
     def embed(self, jpeg: bytes) -> np.ndarray:
         if self._model is not None and self._preprocess is not None:
@@ -122,14 +134,123 @@ class ImageEmbedder:
             with torch.no_grad():
                 feats = self._model.get_image_features(**inputs)
             v = feats[0].detach().float().cpu().numpy()
-            v /= max(float(np.linalg.norm(v)), 1e-6)
             TextEmbedder._cleanup()
-            # CLIP ViT-B/32 outputs 512 — project down to DIM by truncation
-            # + renormalize so it fits the si_* store dimension.
-            if v.shape[0] != DIM:
-                v = v[:DIM] / max(float(np.linalg.norm(v[:DIM])), 1e-6)
-            return v.astype(np.float32)
+            return project_clip(v, DIM)
         return hash_embedding_bytes(jpeg)
+
+
+def normalize_device(device: str) -> str:
+    """Map our device vocabulary onto what PyTorch accepts.
+
+    ``rocm`` is *our* name for the extra; PyTorch exposes ROCm through the CUDA
+    device API, so ``.to("rocm")`` raises and the caller would silently fall
+    back to the hash backend on exactly the hardware the ROCm extra is for.
+    """
+    return "cuda" if device in {"cuda", "rocm"} else device
+
+
+def _load_clip(device: str):
+    """Load the CLIP checkpoint once; ``None`` when the stack is absent.
+
+    Both the image encoder and the image-space *text* encoder MUST be built
+    from this one function. Two different checkpoints (or two different
+    preprocessing pipelines) do not share a space, and text→image search would
+    then return confident nonsense instead of failing.
+    """
+    try:
+        import torch
+        from transformers import CLIPModel, CLIPProcessor
+
+        device = normalize_device(device)
+        if device == "cuda" and not torch.cuda.is_available():
+            device = "cpu"
+        model = CLIPModel.from_pretrained(CLIP_MODEL_NAME).to(device)
+        processor = CLIPProcessor.from_pretrained(CLIP_MODEL_NAME)
+        return model, processor, device
+    except Exception:
+        return None
+
+
+def project_clip(v: np.ndarray, dim: int = DIM) -> np.ndarray:
+    """Project a CLIP feature into the ``si_*`` store width, L2-normalised.
+
+    Truncate-then-renormalise, applied identically to text and image features —
+    that shared transform is the whole reason the two projections are
+    comparable. It is lossy and crude: a learned 512→dim projection would
+    preserve far more cross-modal structure, and nothing here should be
+    presented as one.
+    """
+    v = np.asarray(v, dtype=np.float32).ravel()
+    if v.shape[0] > dim:
+        v = v[:dim]
+    return (v / max(float(np.linalg.norm(v)), 1e-6)).astype(np.float32)
+
+
+class ImageTextUnavailable(RuntimeError):
+    """No CLIP stack — text cannot be placed in the image space."""
+
+
+@dataclass
+class ImageTextEmbedder:
+    """Text → image space (the CLIP text tower), sharing the image encoder's
+    checkpoint and preprocessing.
+
+    Deliberately has **no** hash fallback: hashed words and hashed pixels live
+    in unrelated spaces, so a fallback embedding would make text→image search
+    return ranked noise while looking like a working feature. Without CLIP the
+    service answers 501 and the caller reports the leg as skipped.
+    """
+
+    model: object = None
+    preprocess: object = None
+    device: str = "cpu"
+
+    @classmethod
+    def from_encoder(cls, encoder: ImageEmbedder) -> "ImageTextEmbedder":
+        """Reuse the loaded image encoder — same checkpoint, one copy in RAM."""
+        return cls(
+            model=encoder._model,
+            preprocess=encoder._preprocess,
+            device=encoder.device,
+        )
+
+    @property
+    def available(self) -> bool:
+        return self.model is not None and self.preprocess is not None
+
+    @property
+    def backend(self) -> str:
+        return "clip" if self.available else "hash"
+
+    @property
+    def space_id(self) -> str:
+        """The *image* space — text queries must land where the screenshots are.
+
+        Always reported as the image encoder's space (never a space of its own),
+        so the two cannot drift: if these ever differed, text→image search would
+        be comparing incomparable vectors. Without CLIP the encoder cannot
+        answer at all (the route returns 501), so the value is inert.
+        """
+        return (
+            f"clip:{CLIP_MODEL_NAME}@{DIM}"
+            if self.available
+            else f"hash:python-image@{DIM}"
+        )
+
+    def embed(self, text: str) -> np.ndarray:
+        if not self.available:
+            raise ImageTextUnavailable(
+                "text→image search needs the CLIP stack; install the ai-cpu/ai-cuda extra"
+            )
+        import torch
+
+        inputs = self.preprocess(text=[text], return_tensors="pt", padding=True)
+        inputs = inputs.to(self.device)
+        with torch.no_grad():
+            feats = self.model.get_text_features(**inputs)
+        v = feats[0].detach().float().cpu().numpy()
+        TextEmbedder._cleanup()
+        return project_clip(v, DIM)
 
 
 class TopicExtractor:

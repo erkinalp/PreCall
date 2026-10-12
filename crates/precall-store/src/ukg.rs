@@ -87,6 +87,15 @@ pub struct WebDwellEntry {
 }
 
 /// A per-client (or local-cache) `ukg.db`.
+/// One capture queued for the backfill/retry pass: `(Id, TimeStamp, ImageToken)`
+/// — the token is mandatory here, the query filters for it.
+pub type QueuedCapture = (i64, Option<i64>, String);
+
+/// One fresh capture awaiting enrichment: `(Id, TimeStamp, ImageToken)`, where
+/// the token may be absent (the image leg is then impossible and the state row
+/// records why).
+pub type PendingCapture = (i64, Option<i64>, Option<String>);
+
 pub struct Ukg {
     conn: Connection,
 }
@@ -422,8 +431,57 @@ impl Ukg {
         Ok(map)
     }
 
-    pub fn app_dwell(&self) -> Result<Vec<AppDwellEntry>, UkgError> {
-        let mut stmt = self.conn.prepare(
+    /// Every capture id inside the requested window/application filter, or
+    /// `None` when no filter is active.
+    ///
+    /// This exists so a **semantic** leg can filter *during* its scan. Filtering
+    /// an already-truncated top-k afterwards drops eligible matches that happen
+    /// to rank below the cut, and in `mode=image` there is no FTS leg to apply
+    /// the constraints instead.
+    pub fn capture_ids_matching_filters(
+        &self,
+        start_100ns: Option<i64>,
+        end_100ns: Option<i64>,
+        app_filter: &[String],
+    ) -> Result<Option<std::collections::HashSet<i64>>, UkgError> {
+        if start_100ns.is_none() && end_100ns.is_none() && app_filter.is_empty() {
+            return Ok(None);
+        }
+        let mut sql = String::from("SELECT w.\"Id\" FROM \"WindowCapture\" w WHERE 1=1");
+        let mut vals: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+        if let Some(s) = start_100ns {
+            sql.push_str(" AND w.\"TimeStamp\" >= ?");
+            vals.push(Box::new(s));
+        }
+        if let Some(e) = end_100ns {
+            sql.push_str(" AND w.\"TimeStamp\" <= ?");
+            vals.push(Box::new(e));
+        }
+        if !app_filter.is_empty() {
+            let marks = vec!["?"; app_filter.len()].join(",");
+            sql.push_str(&format!(
+                " AND w.\"Id\" IN (SELECT r.\"WindowCaptureId\" FROM \"WindowCaptureAppRelation\" r
+                   JOIN \"App\" a ON a.\"Id\" = r.\"AppId\"
+                   WHERE a.\"Path\" IN ({marks}) OR a.\"Name\" IN ({marks}))"
+            ));
+            for f in app_filter {
+                vals.push(Box::new(f.clone()));
+            }
+            for f in app_filter {
+                vals.push(Box::new(f.clone()));
+            }
+        }
+        let refs: Vec<&dyn rusqlite::ToSql> = vals.iter().map(|v| v.as_ref()).collect();
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map(&refs[..], |r| r.get::<_, i64>(0))?;
+        let mut out = std::collections::HashSet::new();
+        for row in rows {
+            out.insert(row?);
+        }
+        Ok(Some(out))
+    }
+
+    pub fn app_dwell(&self) -> Result<Vec<AppDwellEntry>, UkgError> {        let mut stmt = self.conn.prepare(
             "SELECT \"WindowsAppId\",\"HourOfDay\",\"DayOfWeek\",\"HourStartTimestamp\",\"DwellTime\"
              FROM \"AppDwellTime\" ORDER BY \"HourStartTimestamp\" DESC LIMIT 10000",
         )?;
@@ -522,6 +580,136 @@ impl Ukg {
             .optional()?)
     }
 
+    // -- image-embedding state -----------------------------------------------
+
+    /// `(State, Attempts, LastError)` for a capture's image embedding.
+    pub fn image_embedding_state(
+        &self,
+        wc_id: i64,
+    ) -> Result<Option<(String, i64, Option<String>)>, UkgError> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT \"State\",\"Attempts\",\"LastError\" FROM \"PrecallImageEmbedding\"
+                 WHERE \"WindowCaptureId\" = ?",
+                params![wc_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()?)
+    }
+
+    /// Record the outcome of one image-embedding attempt.
+    pub fn set_image_embedding_state(
+        &self,
+        wc_id: i64,
+        state: &str,
+        attempts: i64,
+        last_error: Option<&str>,
+        now: i64,
+    ) -> Result<(), UkgError> {
+        self.conn.execute(
+            "INSERT INTO \"PrecallImageEmbedding\"
+             (\"WindowCaptureId\",\"State\",\"Attempts\",\"LastError\",\"UpdatedAt\")
+             VALUES (?,?,?,?,?)
+             ON CONFLICT(\"WindowCaptureId\") DO UPDATE SET
+               \"State\" = excluded.\"State\",
+               \"Attempts\" = excluded.\"Attempts\",
+               \"LastError\" = excluded.\"LastError\",
+               \"UpdatedAt\" = excluded.\"UpdatedAt\"",
+            params![wc_id, state, attempts, last_error, now],
+        )?;
+        Ok(())
+    }
+
+    /// Captures that still need an image embedding even though their text leg
+    /// is already done — the backfill/retry queue.
+    ///
+    /// Excludes `IsProcessed = 0` rows on purpose: those are the enrichment
+    /// loop's *fresh* captures, which run the image leg inline. Ordering is
+    /// **least-recently-attempted first** and rows attempted within `backoff`
+    /// are skipped, so a batch of permanently stuck captures cannot monopolize
+    /// the queue and starve every later capture (the queue is `LIMIT`ed).
+    pub fn captures_needing_image_embedding(
+        &self,
+        limit: i64,
+        now: i64,
+        backoff: i64,
+    ) -> Result<Vec<QueuedCapture>, UkgError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT w.\"Id\", w.\"TimeStamp\", w.\"ImageToken\"
+             FROM \"WindowCapture\" w
+             LEFT JOIN \"PrecallImageEmbedding\" e ON e.\"WindowCaptureId\" = w.\"Id\"
+             LEFT JOIN \"PrecallEnrichAttempt\" a ON a.\"WindowCaptureId\" = w.\"Id\"
+             WHERE w.\"ImageToken\" IS NOT NULL
+               AND w.\"IsProcessed\" = 1
+               AND (e.\"State\" IS NULL OR e.\"State\" = 'pending')
+               AND (a.\"UpdatedAt\" IS NULL OR a.\"UpdatedAt\" <= ?)
+             ORDER BY COALESCE(a.\"UpdatedAt\", 0) ASC, w.\"Id\" ASC
+             LIMIT ?",
+        )?;
+        let rows = stmt.query_map(params![now - backoff, limit], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+        })?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// The fresh-capture queue: `IsProcessed = 0`, ordered and paced like the
+    /// backfill queue.
+    ///
+    /// A fresh capture can stay unprocessed because an *image* attempt failed
+    /// (the queue keeps it retryable) or because its text leg failed. Without
+    /// the same backoff and rotation the backfill queue has, 64 such captures
+    /// would be reselected every poll and every later capture would be starved
+    /// of enrichment entirely.
+    pub fn captures_pending_enrichment(
+        &self,
+        limit: i64,
+        now: i64,
+        backoff: i64,
+    ) -> Result<Vec<PendingCapture>, UkgError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT w.\"Id\", w.\"TimeStamp\", w.\"ImageToken\"
+             FROM \"WindowCapture\" w
+             LEFT JOIN \"PrecallEnrichAttempt\" a ON a.\"WindowCaptureId\" = w.\"Id\"
+             WHERE w.\"IsProcessed\" = 0
+               AND (a.\"UpdatedAt\" IS NULL OR a.\"UpdatedAt\" <= ?)
+             ORDER BY COALESCE(a.\"UpdatedAt\", 0) ASC, w.\"Id\" ASC
+             LIMIT ?",
+        )?;
+        let rows = stmt.query_map(params![now - backoff, limit], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+        })?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// Forget every image-embedding verdict, so the next pass rebuilds the
+    /// image index (used when the embedding space changes). Pacing rows go too:
+    /// an explicit rebuild must not be paced out by the attempt that triggered
+    /// it.
+    pub fn reset_image_embedding_states(&self) -> Result<(), UkgError> {
+        self.conn.execute("DELETE FROM \"PrecallImageEmbedding\"", [])?;
+        Ok(())
+    }
+
+    /// Re-queue every capture for the text leg (used when the text embedding
+    /// space changes).
+    pub fn mark_all_unprocessed(&self) -> Result<(), UkgError> {
+        self.conn
+            .execute("UPDATE \"WindowCapture\" SET \"IsProcessed\" = 0", [])?;
+        Ok(())
+    }
+
+    /// Record that this capture was attempted now, whichever leg — the clock
+    /// both queues pace themselves against.
+    pub fn touch_enrich_attempt(&self, wc_id: i64, now: i64) -> Result<(), UkgError> {
+        self.conn.execute(
+            "INSERT INTO \"PrecallEnrichAttempt\" (\"WindowCaptureId\",\"UpdatedAt\") VALUES (?,?)
+             ON CONFLICT(\"WindowCaptureId\") DO UPDATE SET \"UpdatedAt\" = excluded.\"UpdatedAt\"",
+            params![wc_id, now],
+        )?;
+        Ok(())
+    }
+
     /// Delete every trace of a client (panic button).
     pub fn purge_all(&self) -> Result<(), UkgError> {
         self.conn.execute_batch(
@@ -534,7 +722,9 @@ impl Ukg {
              DELETE FROM \"WindowCapture\";
              DELETE FROM \"AppDwellTime\";
              DELETE FROM \"WebDomainDwellTime\";
-             DELETE FROM \"PrecallSyncState\";",
+             DELETE FROM \"PrecallSyncState\";
+             DELETE FROM \"PrecallImageEmbedding\";
+             DELETE FROM \"PrecallEnrichAttempt\";",
         )?;
         Ok(())
     }

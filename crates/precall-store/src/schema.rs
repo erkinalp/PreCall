@@ -158,6 +158,33 @@ CREATE TABLE IF NOT EXISTS "PrecallClient" (
     "FirstSeen" INTEGER NOT NULL,
     "LastSeen" INTEGER NOT NULL
 );
+
+-- Per-capture image-embedding state. The text leg can key off
+-- `WindowCapture.IsProcessed`, but image embeddings must survive two
+-- situations that flag cannot express: captures processed by an older,
+-- text-only build (backfill), and transient AI-service failures (retry).
+-- `State` is 'pending' | 'done' | 'skipped'; 'skipped' means the input itself
+-- was refused and retrying it would never succeed.
+CREATE TABLE IF NOT EXISTS "PrecallImageEmbedding" (
+    "WindowCaptureId" INTEGER PRIMARY KEY,
+    "State" TEXT NOT NULL,
+    "Attempts" INTEGER NOT NULL DEFAULT 0,
+    "LastError" TEXT,
+    "UpdatedAt" INTEGER,
+    FOREIGN KEY("WindowCaptureId") REFERENCES "WindowCapture"("Id") ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS "IX_PrecallImageEmbedding_State"
+    ON "PrecallImageEmbedding"("State");
+
+-- When this capture was last *attempted*, whichever leg it was. Queue pacing
+-- must not hang off the image state row: a capture whose image leg is done
+-- while its text leg keeps failing would never advance that timestamp, so the
+-- same rows would be selected every poll and starve the rest of the queue.
+CREATE TABLE IF NOT EXISTS "PrecallEnrichAttempt" (
+    "WindowCaptureId" INTEGER PRIMARY KEY,
+    "UpdatedAt" INTEGER NOT NULL,
+    FOREIGN KEY("WindowCaptureId") REFERENCES "WindowCapture"("Id") ON DELETE CASCADE
+);
 "#;
 
 /// `si_*` schema shared by `SemanticTextStore.db` and `SemanticImageStore.db`.
