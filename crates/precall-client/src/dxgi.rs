@@ -225,10 +225,13 @@ impl Duplicator {
                     std::ptr::copy_nonoverlapping(src, dst, row_bytes);
                 }
                 self.ctx.Unmap(&self.staging, 0);
+                let (dirty, moved) = Self::read_metadata(&self.dup, &info);
                 Ok(CaptureFrame {
                     bgra,
                     width: self.width,
                     height: self.height,
+                    dirty,
+                    moved,
                     metadata_bytes: info.TotalMetadataBufferSize,
                 })
             })();
