@@ -293,3 +293,86 @@ fn solid_jpeg(w: u32, h: u32, rgb: [u8; 3]) -> Vec<u8> {
         .unwrap();
     out
 }
+
+/// A small edit is often a *single* rectangle. Treating one JPEG region as a
+/// keyframe archived the patch itself as the capture and replaced the desktop
+/// surface with a patch-sized image, corrupting every later composition — so the
+/// keyframe test is geometric, not a region count.
+#[tokio::test]
+async fn a_single_rectangle_delta_composes_onto_the_surface() {
+    let dir = tempfile::tempdir().unwrap();
+    let (certs, key, fingerprint) = test_cert();
+    let tls_cfg = tls::server_config_from(certs, key).unwrap();
+    let broker = Arc::new(Broker::new(config(dir.path()), tls_cfg).unwrap());
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let b = Arc::clone(&broker);
+    let handle = tokio::spawn(async move { b.run_on(listener).await });
+
+    let client_id = Uuid::new_v4();
+    let tls = pinned_client_config(&fingerprint).unwrap();
+    let mut session = Session::connect(
+        addr,
+        "localhost",
+        tls,
+        AuthMethod::Psk { token: PSK.into() },
+        client_id,
+        "ONERECT",
+    )
+    .await
+    .expect("handshake");
+
+    // Keyframe: the mock advertises 1280x720 and sends a full-surface rect.
+    let base = SyntheticFrame {
+        jpeg: solid_jpeg(1280, 720, [255, 255, 255]),
+        meta: sample_meta(1, "base-1"),
+    };
+    session.send_capture(&base).await.unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+
+    // One rectangle. It must compose, not become the capture.
+    let regions = vec![(Rect::new(100, 100, 200, 150), solid_jpeg(100, 50, [255, 0, 0]))];
+    let dirty = SyntheticFrame {
+        jpeg: vec![],
+        meta: sample_meta(2, "one-rect-2"),
+    };
+    session.send_dirty_regions(&regions, &dirty.meta).await.unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    session.close().await.unwrap();
+    handle.abort();
+
+    let client_dir = dir.path().join(client_id.to_string());
+    let ukg = Ukg::open(&client_dir.join("ukg.db")).unwrap();
+    let timeline = ukg.timeline(None, 10).unwrap();
+    assert_eq!(timeline.len(), 2);
+    let token = ukg.image_token(timeline[0].id).unwrap().unwrap();
+    assert_eq!(token, "one-rect-2");
+    let ts = timeline[0].timestamp_100ns;
+    let (y, m, d) = precall_broker::filetime_to_ymd(ts);
+    let key = load_or_create_key(dir.path()).unwrap();
+    let objects = ObjectStore::encrypted(client_dir.join("objects"), key).unwrap();
+    let rel = std::path::PathBuf::from(client_id.to_string())
+        .join(format!("{y:04}"))
+        .join(format!("{m:02}"))
+        .join(format!("{d:02}"))
+        .join(format!("{token}.jpg"));
+    assert!(objects.exists(&rel), "the delta is archived as a composed .jpg");
+
+    let bytes = objects.get(&client_id.to_string(), &rel, &token).unwrap();
+    let img = image::load_from_memory(&bytes).unwrap().to_rgb8();
+    assert_eq!(
+        (img.width(), img.height()),
+        (1280, 720),
+        "the archive is the desktop, not the patch"
+    );
+    let near = |p: [u8; 3], want: [u8; 3]| p.iter().zip(want.iter()).all(|(a, b)| a.abs_diff(*b) <= 6);
+    assert!(near(img.get_pixel(150, 125).0, [255, 0, 0]), "patch applied");
+    assert!(
+        near(img.get_pixel(1000, 600).0, [255, 255, 255]),
+        "the keyframe's desktop survives"
+    );
+    assert!(
+        near(img.get_pixel(50, 50).0, [255, 255, 255]),
+        "and outside the patch too"
+    );
+}

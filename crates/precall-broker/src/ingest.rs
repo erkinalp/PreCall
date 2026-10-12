@@ -40,6 +40,10 @@ pub struct ClientStore {
     /// sends dirty rectangles. A full-frame-only client never pays a decode:
     /// its frames are archived verbatim, exactly as before.
     pub canvas: std::sync::Arc<std::sync::Mutex<Option<crate::canvas::Canvas>>>,
+    /// Display size the client advertised in its hello, `(0, 0)` if it did not
+    /// say. A one-rectangle frame is only a keyframe if that rectangle covers
+    /// this surface.
+    pub display: (u32, u32),
 }
 
 pub struct Broker {
@@ -128,6 +132,7 @@ impl Broker {
             text_index,
             image_index,
             canvas: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            display: (0, 0),
         })
     }
 
@@ -165,7 +170,10 @@ impl Broker {
                 return Err(BrokerError::AuthRejected(reason));
             }
         }
-        let store = self.open_store(hello.client_id)?;
+        let mut store = self.open_store(hello.client_id)?;
+        if let Some(display) = hello.capabilities.displays.first() {
+            store.display = (display.width, display.height);
+        }
         let cid = hello.client_id.to_string();
         let now = filetime_now() as i64;
         store.ukg.touch_client(&cid, &hello.hostname, now)?;
@@ -293,9 +301,7 @@ impl Broker {
                 // route, image embedder, timeline, export — keeps seeing one
                 // full-frame image per capture, exactly as Recall's own store
                 // does. (RDPEGFX composes into a surface the same way.)
-                let payload: Option<(&str, bytes::Bytes)> = if f.regions == 1
-                    && f.codec_id == RDPGFX_CODECID_JPEG
-                {
+                let payload: Option<(&str, bytes::Bytes)> = if is_full_surface(&f, store.display) {
                     // A keyframe: archive it verbatim, and keep the surface
                     // current from it when this client also sends rectangles.
                     if store.canvas.lock().unwrap().is_some() {
@@ -305,13 +311,16 @@ impl Broker {
                         }
                     }
                     Some(("jpg", f.data.clone()))
-                } else if f.regions > 1 {
+                } else {
+                    // Every other frame is a delta, whatever its region count —
+                    // one rectangle is a perfectly ordinary small edit. The
+                    // compositor answers `None` when there is no surface to
+                    // seed or the codec cannot be composed, and then the region
+                    // blob is stored honestly rather than as a corrupt image.
                     match compose_dirty_rects(store, &cid, &f) {
                         Some(jpeg) => Some(("jpg", jpeg)),
                         None => Some(("raw", f.data.clone())),
                     }
-                } else {
-                    Some(("raw", f.data.clone()))
                 };
 
                 if let Some((ext, bytes)) = payload {
@@ -409,6 +418,37 @@ impl Broker {
     }
 }
 
+/// Is this frame the whole desktop (a keyframe), rather than a delta?
+///
+/// Counting regions is *not* enough: a small edit is commonly a single
+/// rectangle, and mistaking it for a keyframe archived the patch as the capture
+/// and replaced the surface with a patch-sized image, corrupting every later
+/// composition. The test is geometric — one rectangle that starts at or before
+/// the origin and reaches the advertised display size.
+///
+/// A client that advertises no display size (the field is optional in practice)
+/// keeps the old behaviour: one JPEG region is treated as a full frame, with a
+/// warning, because guessing "delta" there would compose a patch onto a surface
+/// that was never seeded.
+fn is_full_surface(frame: &PendingFrame, display: (u32, u32)) -> bool {
+    if frame.codec_id != RDPGFX_CODECID_JPEG || frame.rects.len() != 1 {
+        return false;
+    }
+    let rect = frame.rects[0].0;
+    let covers = rect.left <= 0 && rect.top <= 0;
+    match display {
+        (0, _) | (_, 0) => {
+            if !frame.rects.is_empty() && !covers {
+                warn!(
+                    "client advertises no display size; treating a single region as a keyframe"
+                );
+            }
+            true
+        }
+        (dw, dh) => covers && rect.right as u32 >= dw && rect.bottom as u32 >= dh,
+    }
+}
+
 /// Quality of the composed archive frame.
 const COMPOSED_JPEG_QUALITY: u8 = 85;
 
@@ -465,11 +505,9 @@ fn canvas_from_last_capture(
 struct PendingFrame {
     codec_id: u16,
     /// The wire payload: the codec's own stream for a single region, or the
-    /// `[l,t,r,b,len][data]…` concatenation for several.
+    /// `[l,t,r,b,len][data]…` concatenation for several. Which one it is is
+    /// decided by [`is_full_surface`], not by the region count.
     data: bytes::Bytes,
-    /// 1 = the payload *is* the codec's stream (a JPEG, typically);
-    /// >1 = concatenated region payloads, which no image decoder accepts.
-    regions: usize,
     /// The rectangles and their payloads, when this frame is a dirty-rect
     /// update — what the compositor needs.
     rects: Vec<(Rect, bytes::Bytes)>,
@@ -508,7 +546,6 @@ impl FrameAssembler {
             return None;
         }
         self.current_id = None;
-        let regions_seen = self.regions.len();
         let rects: Vec<(Rect, bytes::Bytes)> = self
             .regions
             .iter()
@@ -531,12 +568,7 @@ impl FrameAssembler {
             }
             (codec, blob.freeze())
         };
-        Some(PendingFrame {
-            codec_id,
-            data,
-            regions: regions_seen,
-            rects,
-        })
+        Some(PendingFrame { codec_id, data, rects })
     }
 }
 

@@ -35,7 +35,7 @@ pub use time::{filetime_now, filetime_to_unix, FILETIME_UNIX_DELTA};
 pub use codec::{read_limited_json, write_limited_json, MuxCodec, MuxFrame, MAX_MUX_PAYLOAD};
 pub use error::ProtoError;
 pub use gfx::{
-    codec_name, GfxPdu, GfxPduIter, Rect, SurfaceInfo, RDPGFX_CMDID_END_FRAME,
+    codec_name, encode_capture_frame, GfxPdu, GfxPduIter, Rect, SurfaceInfo, RDPGFX_CMDID_END_FRAME,
     RDPGFX_CMDID_FRAMEACKNOWLEDGE, RDPGFX_CMDID_START_FRAME, RDPGFX_CMDID_WIRETOSURFACE_1,
     RDPGFX_CODECID_AVC420, RDPGFX_CODECID_AVC444, RDPGFX_CODECID_CAPROGRESSIVE_V2,
     RDPGFX_CODECID_JPEG, RDPGFX_CODECID_UNCOMPRESSED, RDPGFX_PIXEL_FORMAT_ARGB_8888,

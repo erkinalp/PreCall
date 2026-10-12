@@ -152,7 +152,7 @@ impl GfxPdu {
             }
     }
 
-    /// Decode exactly one PDU from the front of `buf`. Returns the PDU and the
+/// Decode exactly one PDU from the front of `buf`. Returns the PDU and the
     /// number of bytes consumed (which may be less than `buf.len()`).
     pub fn decode(buf: &[u8]) -> Result<(GfxPdu, usize), ProtoError> {
         if buf.len() < HEADER_LEN {
@@ -261,4 +261,35 @@ pub fn codec_name(codec_id: u16) -> &'static str {
         RDPGFX_CODECID_JPEG => "jpeg-precall",
         _ => "unknown",
     }
+}
+
+/// Frame one capture's regions into a GFXRDP payload: START, one
+/// `WIRE_TO_SURFACE` per region, END.
+///
+/// This exists so the wire layout is built by the codec that parses it. The
+/// client used to hand-roll these bytes and got the START_FRAME envelope and the
+/// rectangle width wrong (flags/length/timestamp mis-sized, 4-byte coordinates
+/// where the PDU has `i16`), so no client frame had ever been decodable — the
+/// mock's `GfxPdu::encode` hid it, because every end-to-end test drives the mock
+/// and the Windows client only ever faced a compiler.
+pub fn encode_capture_frame(
+    frame_id: u32,
+    timestamp: u32,
+    surface_id: u16,
+    regions: &[(Rect, Bytes)],
+) -> BytesMut {
+    let mut out = BytesMut::new();
+    GfxPdu::StartFrame { frame_id, timestamp }.encode(&mut out);
+    for (rect, bitmap) in regions {
+        GfxPdu::WireToSurface1 {
+            surface_id,
+            codec_id: RDPGFX_CODECID_JPEG,
+            pixel_format: RDPGFX_PIXEL_FORMAT_XRGB_8888,
+            dest_rect: *rect,
+            bitmap_data: bitmap.clone(),
+        }
+        .encode(&mut out);
+    }
+    GfxPdu::EndFrame { frame_id }.encode(&mut out);
+    out
 }

@@ -56,9 +56,15 @@ impl<T> LatestSlot<T> {
     /// instead of blocking forever — without this, a capture thread that died
     /// (duplication lost and not recoverable) left the send loop blocked on a
     /// slot nobody would ever fill, still heartbeating, capturing nothing.
+    ///
+    /// The flag is set **while holding the slot mutex**: a waiter that checked
+    /// the flag and is about to `wait` must not miss the notification, or it
+    /// sleeps forever and the dead-producer symptom comes back.
     pub fn close(&self) {
+        let guard = self.slot.lock().unwrap();
         self.closed.store(true, Ordering::SeqCst);
         self.ready.notify_all();
+        drop(guard);
     }
 
     pub fn is_closed(&self) -> bool {
@@ -222,34 +228,49 @@ mod tests {
 
     #[test]
     fn slot_bounds_memory_under_a_producer_faster_than_the_consumer() {
-        let slot = Arc::new(LatestSlot::new());
-        let producer = {
-            let slot = Arc::clone(&slot);
-            std::thread::spawn(move || {
-                for i in 0..100_000u64 {
-                    slot.publish(vec![0u8; 1024]);
-                    if i % 64 == 0 {
-                        std::thread::yield_now();
-                    }
-                }
-            })
-        };
-        // Slow consumer: one frame per iteration, so most are dropped.
-        for _ in 0..100 {
-            let _ = slot.recv();
+        // Deterministic: publish everything *before* the consumer runs, so no
+        // assertion depends on which thread wins a race (an earlier version
+        // blocked a `recv()` that the producer might never satisfy).
+        let slot = LatestSlot::new();
+        for i in 0..100_000u64 {
+            slot.publish(vec![i as u8; 1024]);
         }
-        producer.join().unwrap();
-        let taken = 100u64;
-        // At most one frame can still be resident; everything else was either
-        // taken or overwritten. That identity *is* the memory bound.
-        let resident = u64::from(slot.try_recv().is_some());
-        assert!(resident <= 1, "the slot must never hold more than one frame");
-        assert_eq!(
-            slot.published(),
-            taken + slot.dropped() + resident,
-            "published = taken + dropped + resident, with resident <= 1"
-        );
-        assert!(slot.dropped() > 99_000, "the fast producer should mostly drop");
+        assert!(!slot.is_closed());
+        // One frame is resident, 99_999 were overwritten; nothing was queued.
+        let mut taken = 0u64;
+        while slot.try_recv().is_some() {
+            taken += 1;
+        }
+        assert_eq!(taken, 1, "exactly one frame survives");
+        assert_eq!(slot.published(), 100_000);
+        assert_eq!(slot.dropped(), 99_999);
+        assert_eq!(slot.published(), taken + slot.dropped());
+    }
+
+    #[test]
+    fn closes_never_lose_their_wakeup() {
+        // Stress the check-then-wait race: the consumer must never sleep past a
+        // close, whatever the interleaving.
+        for _ in 0..500 {
+            let slot = Arc::new(LatestSlot::<u32>::new());
+            let consumer = {
+                let slot = Arc::clone(&slot);
+                let (tx, rx) = std::sync::mpsc::channel();
+                std::thread::spawn(move || {
+                    let _ = tx.send(slot.recv());
+                });
+                rx
+            };
+            // Interleave close with the consumer's entry into recv().
+            if slot.published().is_multiple_of(2) {
+                std::thread::yield_now();
+            }
+            slot.close();
+            let outcome = consumer
+                .recv_timeout(Duration::from_secs(2))
+                .expect("a closed slot must wake its consumer (lost wakeup)");
+            assert_eq!(outcome, None);
+        }
     }
 
     #[test]
@@ -350,6 +371,45 @@ impl Rect {
     pub fn is_empty(&self) -> bool {
         self.width() == 0 || self.height() == 0
     }
+}
+
+/// Merge rectangles that overlap (or touch) into their bounding box.
+///
+/// The client accumulates the dirty lists of every frame it discards between
+/// captures — each list describes changes since the *previous acquired* frame,
+/// so dropping them would apply only the newest change to the server's surface
+/// and silently archive stale screenshots. Merging keeps that union inside
+/// [`MAX_DIRTY_RECTS`], which is what makes the accumulated delta still a delta
+/// instead of a keyframe.
+pub fn merge_rects(rects: &[Rect]) -> Vec<Rect> {
+    let mut out: Vec<Rect> = Vec::with_capacity(rects.len());
+    for &r in rects.iter().filter(|r| !r.is_empty()) {
+        let mut merged = r;
+        let mut i = 0;
+        while i < out.len() {
+            if touches(&merged, &out[i]) {
+                let other = out.swap_remove(i);
+                merged = Rect::new(
+                    merged.left.min(other.left),
+                    merged.top.min(other.top),
+                    merged.right.max(other.right),
+                    merged.bottom.max(other.bottom),
+                );
+                // The new box may now touch rectangles already merged in.
+                i = 0;
+            } else {
+                i += 1;
+            }
+        }
+        out.push(merged);
+    }
+    out.sort_by_key(|r| (r.top, r.left, r.bottom, r.right));
+    out
+}
+
+/// Do two rectangles overlap or sit edge-to-edge (within a pixel)?
+fn touches(a: &Rect, b: &Rect) -> bool {
+    a.left - 1 <= b.right && b.left - 1 <= a.right && a.top - 1 <= b.bottom && b.top - 1 <= a.bottom
 }
 
 /// Biggest rectangle list we will send for one capture. DXGI can report a lot
@@ -527,6 +587,54 @@ mod dirty_tests {
         assert!(
             region.len() * 50 < full,
             "a 200x100 edit is <1/50 of the frame's bytes"
+        );
+    }
+}
+
+#[cfg(test)]
+mod merge_tests {
+    use super::*;
+
+    #[test]
+    fn overlapping_and_adjacent_rectangles_merge_transitively() {
+        // A chain: (0..10) touches (11..20) touches (21..30) — one box.
+        let merged = merge_rects(&[
+            Rect::new(0, 0, 10, 10),
+            Rect::new(11, 0, 20, 10),
+            Rect::new(21, 0, 30, 10),
+        ]);
+        assert_eq!(merged, vec![Rect::new(0, 0, 30, 10)]);
+
+        // Overlapping boxes become their bounding box.
+        let merged = merge_rects(&[Rect::new(0, 0, 10, 10), Rect::new(5, 5, 20, 20)]);
+        assert_eq!(merged, vec![Rect::new(0, 0, 20, 20)]);
+
+        // Distant boxes stay separate, in a deterministic order.
+        let merged = merge_rects(&[Rect::new(100, 100, 110, 110), Rect::new(0, 0, 10, 10)]);
+        assert_eq!(
+            merged,
+            vec![Rect::new(0, 0, 10, 10), Rect::new(100, 100, 110, 110)]
+        );
+
+        // Empty rectangles are dropped, not merged into anything.
+        assert!(merge_rects(&[Rect::new(5, 5, 5, 5)]).is_empty());
+    }
+
+    /// Accumulating the dirty lists of discarded frames must not turn a small
+    /// change into something past the per-capture budget.
+    #[test]
+    fn accumulation_stays_a_delta() {
+        // A caret blinking inside one text box, reported by 40 discarded frames
+        // at slightly different positions.
+        let dirty: Vec<Rect> = (0..40)
+            .map(|i| Rect::new(200 + i, 100, 202 + i, 120))
+            .collect();
+        let merged = merge_rects(&dirty);
+        assert_eq!(merged.len(), 1, "all of it is one text box: {merged:?}");
+        let plan = plan_capture(&merged, false, 1920 * 1080, false);
+        assert!(
+            matches!(plan, CapturePlan::Regions(_)),
+            "still sendable as a delta: {plan:?}"
         );
     }
 }

@@ -241,6 +241,23 @@ impl Duplicator {
     }
 }
 
+/// Size of the primary output, for the hello.
+///
+/// The broker needs it to tell a full-frame keyframe from a single-rectangle
+/// delta; without it a small edit looks like a keyframe and would be archived
+/// as the capture.
+pub fn primary_output_size() -> Result<(u32, u32), ClientError> {
+    unsafe {
+        let factory: IDXGIFactory1 = CreateDXGIFactory1()?;
+        let adapter: IDXGIAdapter1 = factory.EnumAdapters1(0)?;
+        let output = adapter.EnumOutputs(0)?;
+        let desc = output.GetDesc()?;
+        let w = (desc.DesktopCoordinates.right as i64 - desc.DesktopCoordinates.left as i64).max(0);
+        let h = (desc.DesktopCoordinates.bottom as i64 - desc.DesktopCoordinates.top as i64).max(0);
+        Ok((w as u32, h as u32))
+    }
+}
+
 /// Spawn the capture thread.
 ///
 /// Frames go into a [`LatestSlot`], **not** a queue: at 1920x1080x60 the display

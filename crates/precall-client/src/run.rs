@@ -114,7 +114,11 @@ pub async fn run(cfg: ClientConfig, mut stop: watch::Receiver<bool>) -> Result<(
             frames = spawn_capture(0, |e| tracing::warn!("capture thread: {e}"));
             frame_chan = frame_bridge(&frames);
         }
-        let conn = match Connection::connect(&cfg).await {
+        // The broker composes dirty rectangles against this size, so it must be
+        // the real desktop, not zero (which used to make every single-rectangle
+        // delta look like a keyframe).
+        let display = crate::dxgi::primary_output_size().unwrap_or((0, 0));
+        let conn = match Connection::connect(&cfg, display).await {
             Ok(c) => {
                 backoff = std::time::Duration::from_millis(500);
                 tracing::info!("connected; session {}", c.hello.session_id);
@@ -141,9 +145,15 @@ pub async fn run(cfg: ClientConfig, mut stop: watch::Receiver<bool>) -> Result<(
         let mut hb_tick =
             tokio::time::interval(std::time::Duration::from_millis(conn.hello.heartbeat_interval_ms.max(5000) as u64));
         let mut latest_frame: Option<crate::dxgi::CaptureFrame> = None;
+        // Dirty rectangles of frames discarded since the last capture we sent.
+        // DXGI reports changes relative to the previous *acquired* frame, so
+        // dropping these would apply only the newest change to the server's
+        // surface and archive screenshots that are stale everywhere else.
+        let mut pending_dirty: Vec<precall_frame::Rect> = Vec::new();
         // A keyframe first: the server has no surface for this connection, and
         // a reconnected client's surface died with its session.
         let mut force_keyframe = true;
+        let mut slot_drops_reported = 0u64;
         let mut pending: std::collections::VecDeque<u64> = std::collections::VecDeque::new();
 
         loop {
@@ -151,7 +161,29 @@ pub async fn run(cfg: ClientConfig, mut stop: watch::Receiver<bool>) -> Result<(
                 _ = stop.changed() => break,
                 f = frame_chan.recv() => {
                     match f {
-                        Some(fr) => latest_frame = Some(fr),
+                        Some(fr) => {
+                            if let Some(prev) = latest_frame.replace(fr) {
+                                // The replaced frame is discarded, so its dirty
+                                // list must be merged into the next delta (each
+                                // list describes changes since the *previous
+                                // acquired* frame) and counted, or the heartbeat
+                                // claims the pipeline is keeping up while frames
+                                // are being thrown away.
+                                if let Some(d) = prev.dirty {
+                                    pending_dirty.extend(d);
+                                }
+                                counters.frames_dropped += 1;
+                            }
+                            // Newest-only: anything already queued is older.
+                            while let Ok(fr) = frame_chan.try_recv() {
+                                if let Some(prev) = latest_frame.replace(fr) {
+                                    if let Some(d) = prev.dirty {
+                                        pending_dirty.extend(d);
+                                    }
+                                    counters.frames_dropped += 1;
+                                }
+                            }
+                        }
                         None => { tracing::error!("capture thread died"); break; }
                     }
                 }
@@ -192,9 +224,15 @@ pub async fn run(cfg: ClientConfig, mut stop: watch::Receiver<bool>) -> Result<(
                     // metadata and scrolled frames force a keyframe, a fresh
                     // connection always starts with one (the server has no
                     // surface for this session yet).
+                    // Everything that changed since the last *sent* capture:
+                    // the discarded frames' dirty rectangles plus this frame's.
+                    if let Some(d) = &frame.dirty {
+                        pending_dirty.extend(d.iter().copied());
+                    }
+                    let merged = precall_frame::merge_rects(&pending_dirty);
                     let plan = match (&frame.dirty, frame.moved) {
-                        (Some(dirty), false) if !force_keyframe => precall_frame::plan_capture(
-                            dirty,
+                        (Some(_), false) if !force_keyframe => precall_frame::plan_capture(
+                            &merged,
                             false,
                             (frame.width as i64) * (frame.height as i64),
                             false,
@@ -317,7 +355,7 @@ pub async fn run(cfg: ClientConfig, mut stop: watch::Receiver<bool>) -> Result<(
                         Payload::Full { jpeg, width, height } => {
                             conn.send_frame(jpeg, *width, *height, now as u64).await
                         }
-                        Payload::Regions(rs) => conn.send_regions(rs, now as u64).await,
+                        Payload::Regions(rs) => conn.send_frame_regions(rs, now as u64).await,
                     };
                     if let Err(e) = sent {
                         tracing::warn!("frame send: {e}");
@@ -328,11 +366,16 @@ pub async fn run(cfg: ClientConfig, mut stop: watch::Receiver<bool>) -> Result<(
                         break;
                     }
                     counters.frames_sent += 1;
-                    // From here the server holds a surface for this session.
+                    // The surface is current as of this capture; from here the
+                    // server holds a surface for this session.
+                    pending_dirty.clear();
                     force_keyframe = false;
                 }
                 _ = hb_tick.tick() => {
-                    counters.frames_dropped = frames.dropped();
+                    // Slot overwrites (the producer outran us) plus frames this
+                    // loop discarded after taking them out of the channel.
+                    counters.frames_dropped += frames.dropped().saturating_sub(slot_drops_reported);
+                    slot_drops_reported = frames.dropped();
                     if let Err(e) = conn.send_ctrl(&ControlMessage::Heartbeat {
                         frames_sent: counters.frames_sent,
                         frames_skipped_unchanged: counters.frames_skipped_unchanged,
