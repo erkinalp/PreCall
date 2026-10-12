@@ -4,7 +4,8 @@
 //! are !Send); frames go out over a std::mpsc channel.
 
 use crate::ClientError;
-use std::sync::mpsc::{channel, Receiver};
+use precall_frame::LatestSlot;
+use std::sync::Arc;
 use windows::core::Interface;
 use windows::Win32::Graphics::Direct3D11::{
     D3D11CreateDevice, D3D11_CPU_ACCESS_READ, D3D11_MAP_READ, D3D11_MAPPED_SUBRESOURCE,
@@ -25,8 +26,11 @@ pub struct CaptureFrame {
     pub bgra: Vec<u8>,
     pub width: u32,
     pub height: u32,
-    /// Dirty rect count from the frame info — 0 = unchanged desktop.
-    pub dirty_regions: u32,
+    /// `DXGI_OUTDUPL_FRAME_INFO::TotalMetadataBufferSize` — the size of the
+    /// *pointer* metadata for this frame, **not** a dirty-rect count and not a
+    /// change signal. Kept for diagnostics only; content changes are detected
+    /// by fingerprinting the pixels.
+    pub metadata_bytes: u32,
 }
 
 /// Owns a duplication session for output `output_index` (0 = primary).
@@ -160,7 +164,7 @@ impl Duplicator {
                     bgra,
                     width: self.width,
                     height: self.height,
-                    dirty_regions: info.TotalMetadataBufferSize,
+                    metadata_bytes: info.TotalMetadataBufferSize,
                 })
             })();
             let _ = self.dup.ReleaseFrame();
@@ -169,27 +173,34 @@ impl Duplicator {
     }
 }
 
-/// Spawn the capture thread. Sends `CaptureFrame`s whenever the desktop
-/// changes; reconnects duplication on AccessLost by recreating the session.
-pub fn spawn_capture(output_index: u32) -> Receiver<Result<CaptureFrame, ClientError>> {
-    let (tx, rx) = channel();
+/// Spawn the capture thread.
+///
+/// Frames go into a [`LatestSlot`], **not** a queue: at 1920x1080x60 the display
+/// produces ~480 MB/s of BGRA, so an unbounded handoff grows without limit and
+/// the stream shows a desktop from minutes ago. The slot holds one frame and
+/// overwrites it, which is how a real-time agent drops frames; the send loop
+/// reads [`LatestSlot::dropped`] into the heartbeat so link pressure is visible.
+///
+/// `on_error` is called once if duplication cannot be (re)established.
+pub fn spawn_capture(
+    output_index: u32,
+    on_error: impl Fn(ClientError) + Send + 'static,
+) -> Arc<LatestSlot<CaptureFrame>> {
+    let slot = Arc::new(LatestSlot::new());
+    let producer = Arc::clone(&slot);
     std::thread::Builder::new()
         .name("precall-dxgi".into())
         .spawn(move || {
             let mut dup = match Duplicator::new(output_index) {
                 Ok(d) => d,
                 Err(e) => {
-                    let _ = tx.send(Err(e));
+                    on_error(e);
                     return;
                 }
             };
             loop {
                 match dup.next_frame(100) {
-                    Ok(Some(f)) => {
-                        if tx.send(Ok(f)).is_err() {
-                            return;
-                        }
-                    }
+                    Ok(Some(f)) => producer.publish(f),
                     Ok(None) => {}
                     Err(_e) => {
                         // AccessLost / InvalidCall → recreate once; persistent
@@ -199,7 +210,7 @@ pub fn spawn_capture(output_index: u32) -> Receiver<Result<CaptureFrame, ClientE
                                 dup = d;
                             }
                             Err(e2) => {
-                                let _ = tx.send(Err(e2));
+                                on_error(e2);
                                 return;
                             }
                         }
@@ -208,5 +219,5 @@ pub fn spawn_capture(output_index: u32) -> Receiver<Result<CaptureFrame, ClientE
             }
         })
         .expect("spawn precall-dxgi");
-    rx
+    slot
 }

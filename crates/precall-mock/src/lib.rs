@@ -177,11 +177,56 @@ impl Session {
         Ok(())
     }
 
+    /// Send one *multi-region* frame: several dirty rectangles inside a single
+    /// START/END pair, the way a dirty-rect capture agent streams a desktop.
+    ///
+    /// `regions` are `(rect, jpeg)` pairs; each is the encoded content of that
+    /// rectangle only.
+    pub async fn send_dirty_regions(
+        &mut self,
+        regions: &[(Rect, Vec<u8>)],
+        meta: &WindowCaptureRecord,
+    ) -> Result<(), anyhow::Error> {
+        self.frame_id += 1;
+        let mut gfx = BytesMut::new();
+        GfxPdu::StartFrame {
+            frame_id: self.frame_id,
+            timestamp: (meta.timestamp_100ns & 0xFFFF_FFFF) as u32,
+        }
+        .encode(&mut gfx);
+        for (rect, jpeg) in regions {
+            GfxPdu::WireToSurface1 {
+                surface_id: 0,
+                codec_id: RDPGFX_CODECID_JPEG,
+                pixel_format: RDPGFX_PIXEL_FORMAT_XRGB_8888,
+                dest_rect: *rect,
+                bitmap_data: bytes::Bytes::copy_from_slice(jpeg),
+            }
+            .encode(&mut gfx);
+        }
+        GfxPdu::EndFrame { frame_id: self.frame_id }.encode(&mut gfx);
+        self.framed
+            .send(MuxFrame::new(ChannelId::GfxRdp, gfx.freeze()))
+            .await?;
+
+        self.seq += 1;
+        let batch = CaptureBatch {
+            client_id: self.client_id,
+            seq: self.seq,
+            captures: vec![meta.clone()],
+        };
+        self.framed
+            .send(MuxFrame::new(ChannelId::PcMeta, serde_json::to_vec(&batch)?))
+            .await?;
+        Ok(())
+    }
+
     pub async fn heartbeat(&mut self, sent: u64, queue: u32) -> Result<(), anyhow::Error> {
         let msg = ControlMessage::Heartbeat {
             frames_sent: sent,
             frames_skipped_unchanged: 0,
             queue_depth: queue,
+            frames_dropped: 0,
         };
         self.framed
             .send(MuxFrame::new(ChannelId::PcCtrl, serde_json::to_vec(&msg)?))

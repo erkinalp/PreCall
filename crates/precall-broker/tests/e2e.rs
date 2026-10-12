@@ -3,7 +3,7 @@
 
 use precall_broker::{tls, Broker, BrokerConfig};
 use precall_mock::{pinned_client_config, sample_meta, synthesize_jpeg, Session, SyntheticFrame};
-use precall_proto::AuthMethod;
+use precall_proto::{AuthMethod, Rect};
 use precall_store::objects::load_or_create_key;
 use precall_store::{ObjectStore, Ukg};
 use std::net::SocketAddr;
@@ -133,4 +133,82 @@ async fn wrong_psk_is_rejected() {
     .await;
     handle.abort();
     assert!(result.is_err(), "bad PSK must not complete handshake");
+}
+
+/// A dirty-rect frame (several WIRE_TO_SURFACE regions in one START/END pair)
+/// is *not* a JPEG, whatever codec its regions used. Storing it as `.jpg`
+/// would serve a corrupt image, hand garbage to the image embedder, and hide
+/// the fact that nothing composites regions yet.
+#[tokio::test]
+async fn multi_region_frames_are_not_labelled_as_jpeg() {
+
+    let dir = tempfile::tempdir().unwrap();
+    let (certs, key, fingerprint) = test_cert();
+    let tls_cfg = tls::server_config_from(certs, key).unwrap();
+    let broker = Arc::new(Broker::new(config(dir.path()), tls_cfg).unwrap());
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let b = Arc::clone(&broker);
+    let handle = tokio::spawn(async move { b.run_on(listener).await });
+
+    let client_id = Uuid::new_v4();
+    let tls = pinned_client_config(&fingerprint).unwrap();
+    let mut session = Session::connect(
+        addr,
+        "localhost",
+        tls,
+        AuthMethod::Psk { token: PSK.into() },
+        client_id,
+        "DIRTYBOX",
+    )
+    .await
+    .expect("handshake");
+
+    let token = "dirty-1";
+    let frame = SyntheticFrame {
+        jpeg: synthesize_jpeg(64, 64, 1),
+        meta: sample_meta(1, token),
+    };
+    // Two independent dirty rectangles, each a small JPEG.
+    let regions = vec![
+        (Rect::new(0, 0, 32, 32), synthesize_jpeg(32, 32, 2)),
+        (Rect::new(32, 32, 64, 64), synthesize_jpeg(32, 32, 3)),
+    ];
+    session.send_dirty_regions(&regions, &frame.meta).await.unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    session.close().await.unwrap();
+    handle.abort();
+
+    let client_dir = dir.path().join(client_id.to_string());
+    let ukg = Ukg::open(&client_dir.join("ukg.db")).unwrap();
+    let timeline = ukg.timeline(None, 10).unwrap();
+    assert_eq!(timeline.len(), 1, "the frame landed");
+
+    let key = load_or_create_key(dir.path()).unwrap();
+    let objects = ObjectStore::encrypted(client_dir.join("objects"), key).unwrap();
+    let ts = timeline[0].timestamp_100ns;
+    let (y, m, d) = precall_broker::filetime_to_ymd(ts);
+    let raw = std::path::PathBuf::from(client_id.to_string())
+        .join(format!("{y:04}"))
+        .join(format!("{m:02}"))
+        .join(format!("{d:02}"))
+        .join(format!("{token}.raw"));
+    assert!(
+        objects.exists(&raw),
+        "the region blob must be stored as .raw, not as a .jpg"
+    );
+    let blob = objects.get(&client_id.to_string(), &raw, token).unwrap();
+    // The assembler's framing: [left,top,right,bottom,len][jpeg] per region.
+    assert!(blob.len() > 2 * 16, "both regions are in the blob");
+    assert_ne!(&blob[..2], &[0xFF, 0xD8], "a concatenation is not a JPEG");
+
+    let jpg = std::path::PathBuf::from(client_id.to_string())
+        .join(format!("{y:04}"))
+        .join(format!("{m:02}"))
+        .join(format!("{d:02}"))
+        .join(format!("{token}.jpg"));
+    assert!(
+        !objects.exists(&jpg),
+        "labelling a region blob .jpg is the bug this test pins"
+    );
 }

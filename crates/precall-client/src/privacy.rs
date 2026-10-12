@@ -22,6 +22,7 @@ pub fn paused() -> bool {
 }
 
 #[derive(Debug)]
+#[derive(Clone)]
 pub struct Exclusions {
     pub processes: Vec<String>,
     pub domains: Vec<String>,

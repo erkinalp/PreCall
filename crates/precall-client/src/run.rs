@@ -24,6 +24,29 @@ pub struct Counters {
     pub frames_sent: u64,
     pub frames_skipped_unchanged: u64,
     pub frames_skipped_privacy: u64,
+    /// Frames the capture thread produced but the pipeline never carried —
+    /// the honest measure of "this link/core cannot hold the cadence".
+    pub frames_dropped: u64,
+}
+
+/// Result of one capture's offloaded preparation.
+enum Prepared {
+    /// Privacy gate: no foreground window, so there is nothing to capture.
+    NoWindow,
+    /// Privacy gate: an excluded window, site, or protected surface.
+    Dropped,
+    Frame(Box<PreparedFrame>),
+}
+
+/// Everything one capture needs, produced off the runtime thread.
+struct PreparedFrame {
+    jpeg: Vec<u8>,
+    width: u32,
+    height: u32,
+    meta: crate::meta::WindowMeta,
+    regions: Vec<precall_proto::metadata::ScreenRegionRecord>,
+    urls: Vec<precall_proto::metadata::WebRecord>,
+    files: Vec<precall_proto::metadata::FileRecord>,
 }
 
 /// Main loop: runs until `stop` flips. Reconnects forever with bounded
@@ -32,33 +55,30 @@ pub async fn run(cfg: ClientConfig, mut stop: watch::Receiver<bool>) -> Result<(
     let exclusions = Exclusions::new(&cfg.excluded_processes, &cfg.excluded_domains);
     let audio_stop = Arc::new(AtomicBool::new(false));
 
-    // Capture + audio threads live for the whole run; frames buffer in
-    // their channels while we're reconnecting.
-    let frame_rx = spawn_capture(0);
+    // Capture + audio threads live for the whole run. Frames do **not** buffer:
+    // the capture thread overwrites a single slot, so a slow pipeline drops
+    // frames instead of accumulating a backlog (and a desktop from minutes ago).
+    let frames = spawn_capture(0, |e| tracing::warn!("capture thread: {e}"));
     let audio_rx = if cfg.enable_audio {
         Some(spawn_loopback(audio_stop.clone()))
     } else {
         None
     };
 
-    // Bridge std::mpsc → tokio without blocking the runtime.
-    let (frame_tx, mut frame_chan) = tokio::sync::mpsc::channel::<crate::dxgi::CaptureFrame>(4);
+    // Bridge the blocking slot into the runtime. Capacity 2 bounds memory at
+    // slot(1) + channel(2) frames however fast the display updates.
+    let (frame_tx, mut frame_chan) = tokio::sync::mpsc::channel::<crate::dxgi::CaptureFrame>(2);
     let (audio_tx, mut audio_chan) =
         tokio::sync::mpsc::channel::<crate::audio::AudioChunk>(8);
-    let frame_bridge = tokio::task::spawn_blocking(move || loop {
-        match frame_rx.recv() {
-            Ok(Ok(f)) => {
-                if frame_tx.blocking_send(f).is_err() {
-                    return;
-                }
-            }
-            Ok(Err(e)) => {
-                tracing::warn!("capture thread: {e}");
+    let frame_bridge = {
+        let frames = std::sync::Arc::clone(&frames);
+        tokio::task::spawn_blocking(move || loop {
+            let f = frames.recv();
+            if frame_tx.blocking_send(f).is_err() {
                 return;
             }
-            Err(_) => return,
-        }
-    });
+        })
+    };
     let audio_enabled = audio_rx.is_some();
     let audio_bridge = audio_rx.map(|rx| {
         tokio::task::spawn_blocking(move || loop {
@@ -103,8 +123,12 @@ pub async fn run(cfg: ClientConfig, mut stop: watch::Receiver<bool>) -> Result<(
         };
         let Some(mut conn) = conn else { continue };
 
-        let mut capture_tick =
-            tokio::time::interval(std::time::Duration::from_millis(cfg.capture_interval_ms.max(200)));
+        // One policy for both operating points: 16 ms streaming, 3000 ms for
+        // Recall's collection cadence. The old floor here was 200 ms, i.e. a
+        // hard 5 captures/s ceiling however the client was configured.
+        let mut capture_tick = tokio::time::interval(std::time::Duration::from_millis(
+            precall_frame::capture_interval_ms(cfg.capture_interval_ms),
+        ));
         let mut hb_tick =
             tokio::time::interval(std::time::Duration::from_millis(conn.hello.heartbeat_interval_ms.max(5000) as u64));
         let mut latest_frame: Option<crate::dxgi::CaptureFrame> = None;
@@ -129,45 +153,79 @@ pub async fn run(cfg: ClientConfig, mut stop: watch::Receiver<bool>) -> Result<(
                 }
                 _ = capture_tick.tick() => {
                     let Some(frame) = latest_frame.take() else { continue };
-                    // Dedup by cheap hash — DXGI can still deliver identical
-                    // frames around mode changes.
-                    let hash = cheap_hash(&frame.bgra);
-                    if hash == last_hash && frame.dirty_regions == 0 {
+                    // Dedup on the content fingerprint. DXGI redelivers an
+                    // identical desktop around mode changes, and a moved pointer
+                    // changes metadata but no pixels; neither is worth a
+                    // capture, a JPEG, or a link slot.
+                    let hash = precall_frame::frame_fingerprint(&frame.bgra);
+                    if hash == last_hash {
                         counters.frames_skipped_unchanged += 1;
                         continue;
                     }
                     last_hash = hash;
 
-                    let meta = foreground_meta();
-                    let protected = is_protected_window(
-                        windows::Win32::Foundation::HWND(meta.hwnd as *mut _)
-                    );
-                    if let Some(reason) = check(Some(&meta), &exclusions, protected) {
-                        if reason != DropReason::NoWindow {
+                    // Everything below is per-capture CPU — 58 ms for a
+                    // desktop-like 1080p frame and 117 ms for photographic
+                    // content (measured, `precall-frame/examples/client_cost`).
+                    // It runs on the blocking pool: on the reactor it would
+                    // stall this loop, and the whole point of the cadence is
+                    // that the *next* capture is decided on time.
+                    let prepare = {
+                        let exclusions = exclusions.clone();
+                        let enable_ocr = cfg.enable_ocr;
+                        let (bgra, width, height) = (frame.bgra, frame.width, frame.height);
+                        tokio::task::spawn_blocking(move || -> Result<Prepared, crate::ClientError> {
+                            let meta = foreground_meta();
+                            let protected = is_protected_window(
+                                windows::Win32::Foundation::HWND(meta.hwnd as *mut _)
+                            );
+                            match check(Some(&meta), &exclusions, protected) {
+                                None => {}
+                                Some(DropReason::NoWindow) => return Ok(Prepared::NoWindow),
+                                Some(_) => return Ok(Prepared::Dropped),
+                            }
+                            let jpeg = encode_jpeg(&bgra, width, height, 80)?;
+                            let regions = if enable_ocr {
+                                ocr_bgra(&bgra, width, height).unwrap_or_default()
+                            } else {
+                                Vec::new()
+                            };
+                            let urls = if meta.pid != 0 {
+                                browser_url(windows::Win32::Foundation::HWND(meta.hwnd as *mut _))
+                            } else {
+                                Vec::new()
+                            };
+                            let files = explorer_paths();
+                            Ok(Prepared::Frame(Box::new(PreparedFrame {
+                                jpeg,
+                                width,
+                                height,
+                                meta,
+                                regions,
+                                urls,
+                                files,
+                            })))
+                        })
+                        .await
+                    };
+                    let prepared = match prepare {
+                        Ok(Ok(Prepared::Frame(f))) => *f,
+                        Ok(Ok(Prepared::Dropped)) => {
                             counters.frames_skipped_privacy += 1;
+                            continue;
                         }
-                        continue;
-                    }
-
-                    // Encode first — if JPEG fails we skip cleanly.
-                    let jpeg = match encode_jpeg(&frame.bgra, frame.width, frame.height, 80) {
-                        Ok(j) => j,
-                        Err(e) => {
+                        // No foreground window is the ordinary case, not a drop.
+                        Ok(Ok(Prepared::NoWindow)) => continue,
+                        Ok(Err(e)) => {
                             tracing::warn!("jpeg: {e}");
                             continue;
                         }
+                        Err(e) => {
+                            tracing::warn!("capture preparation panicked: {e}");
+                            continue;
+                        }
                     };
-                    let regions = if cfg.enable_ocr {
-                        ocr_bgra(&frame.bgra, frame.width, frame.height).unwrap_or_default()
-                    } else {
-                        Vec::new()
-                    };
-                    let urls = if meta.pid != 0 {
-                        browser_url(windows::Win32::Foundation::HWND(meta.hwnd as *mut _))
-                    } else {
-                        Vec::new()
-                    };
-                    let files = explorer_paths();
+                    let PreparedFrame { jpeg, width, height, meta, regions, urls, files } = prepared;
                     let token = uuid::Uuid::new_v4().to_string();
                     let now = filetime_now();
                     pending.push_back(now);
@@ -191,7 +249,7 @@ pub async fn run(cfg: ClientConfig, mut stop: watch::Receiver<bool>) -> Result<(
                         webs: urls,
                         regions,
                     };
-                    if let Err(e) = conn.send_frame(&jpeg, frame.width, frame.height, now as u64).await {
+                    if let Err(e) = conn.send_frame(&jpeg, width, height, now as u64).await {
                         tracing::warn!("frame send: {e}");
                         break;
                     }
@@ -202,10 +260,12 @@ pub async fn run(cfg: ClientConfig, mut stop: watch::Receiver<bool>) -> Result<(
                     counters.frames_sent += 1;
                 }
                 _ = hb_tick.tick() => {
+                    counters.frames_dropped = frames.dropped();
                     if let Err(e) = conn.send_ctrl(&ControlMessage::Heartbeat {
                         frames_sent: counters.frames_sent,
                         frames_skipped_unchanged: counters.frames_skipped_unchanged,
                         queue_depth: pending.len() as u32,
+                        frames_dropped: counters.frames_dropped,
                     }).await {
                         tracing::warn!("heartbeat: {e}");
                         break;
@@ -239,18 +299,6 @@ pub async fn run(cfg: ClientConfig, mut stop: watch::Receiver<bool>) -> Result<(
         b.abort();
     }
     Ok(())
-}
-
-/// Cheap frame-dedup hash over sampled bytes.
-fn cheap_hash(bgra: &[u8]) -> u64 {
-    let mut h = 0xcbf29ce484222325u64;
-    for chunk in bgra.chunks(4096) {
-        for &b in chunk.iter().take(16) {
-            h ^= b as u64;
-            h = h.wrapping_mul(0x100000001b3);
-        }
-    }
-    h
 }
 
 /// Non-blocking read of the next control message on the wire.

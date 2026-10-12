@@ -1422,6 +1422,7 @@ dependencies = [
  "clap",
  "futures-util",
  "image",
+ "precall-frame",
  "precall-proto",
  "rustls",
  "rustls-pemfile",
@@ -1439,6 +1440,13 @@ dependencies = [
  "webpki-roots",
  "windows",
  "windows-service",
+]
+
+[[package]]
+name = "precall-frame"
+version = "0.1.0"
+dependencies = [
+ "image",
 ]
 
 [[package]]

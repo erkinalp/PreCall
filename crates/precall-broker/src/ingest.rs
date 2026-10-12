@@ -273,7 +273,22 @@ impl Broker {
             // are produced in the same order).
             let frame = pending.pop_front();
             if let Some(f) = frame {
-                let ext = if f.codec_id == RDPGFX_CODECID_JPEG { "jpg" } else { "raw" };
+                // Only a *single* region is the codec's own stream. A
+                // multi-region frame is the assembler's concatenation
+                // (`[l,t,r,b,len][data]…`), so calling it `.jpg` would store a
+                // corrupt image, serve it as `image/jpeg`, and hand garbage to
+                // the image embedder.
+                let ext = if f.regions == 1 && f.codec_id == RDPGFX_CODECID_JPEG {
+                    "jpg"
+                } else {
+                    if f.regions > 1 {
+                        warn!(
+                            regions = f.regions,
+                            "multi-region frame stored as a region blob (compositing not implemented)"
+                        );
+                    }
+                    "raw"
+                };
                 let ts = capture.timestamp_100ns as i64;
                 let date = filetime_to_ymd(ts);
                 store.objects.put(
@@ -346,6 +361,9 @@ impl Broker {
 struct PendingFrame {
     codec_id: u16,
     data: bytes::Bytes,
+    /// 1 = the payload *is* the codec's stream (a JPEG, typically);
+    /// >1 = concatenated region payloads, which no image decoder accepts.
+    regions: usize,
 }
 
 /// Accumulates START/W2S*/END state.
@@ -372,11 +390,16 @@ impl FrameAssembler {
     /// Single-JPEG-region frames (snapshot mode) yield the JPEG verbatim;
     /// multi-region frames yield the concatenated region payloads — decoding
     /// non-JPEG codecs is a later concern.
+    ///
+    /// The region count travels with the payload because it decides how the
+    /// object may be labelled: the concatenation is **not** a JPEG, whatever
+    /// codec the regions used.
     fn finish(&mut self, frame_id: u32) -> Option<PendingFrame> {
         if self.current_id != Some(frame_id) {
             return None;
         }
         self.current_id = None;
+        let regions_seen = self.regions.len();
         let (codec_id, data) = if self.regions.len() == 1 {
             let (c, _, d) = self.regions.pop().unwrap();
             (c, d)
@@ -394,7 +417,11 @@ impl FrameAssembler {
             }
             (codec, blob.freeze())
         };
-        Some(PendingFrame { codec_id, data })
+        Some(PendingFrame {
+            codec_id,
+            data,
+            regions: regions_seen,
+        })
     }
 }
 

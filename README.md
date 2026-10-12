@@ -132,6 +132,61 @@ rebuild reports the mismatch in `notes` instead of ranking incomparable
 vectors. (The Rust and Python hash fallbacks are different functions and carry
 different ids.)
 
+## Performance envelope (measured, not estimated)
+
+Two operating points matter: **full framerate** (streaming) and **Recall's
+collection cadence** (a capture every few seconds, nothing while the desktop is
+unchanged). Both are reproduced by two harnesses in this repo:
+
+```bash
+cargo run --release -p precall-broker --example frame_throughput   # server + wire
+cargo run --release -p precall-frame  --example client_cost        # client per-frame CPU
+```
+
+Measured on a workstation (1920x1080, ~130-220 KiB/frame JPEG q80, TLS 1.3,
+real handshake, real RDPGFX framing, AES-GCM at rest):
+
+| stage | measured | note |
+|---|---|---|
+| broker ingest, encrypted | **1494 captures/s** (201 MB/s) | end-to-end, sent *and* committed |
+| broker ingest, plaintext objects | 3072 captures/s | at-rest encryption costs ~51% of throughput |
+| `put` + `insert_capture` | ~1980 captures/s combined | store alone never the ceiling |
+| client JPEG q80, desktop-like | 57 ms/frame → **17 fps per core** | photographic: 116 ms → 8.6 fps, 2.8 MiB/frame |
+| client dedup fingerprint | 0.12 ms/frame (sampled 1/64) | full-buffer hashing would be 7.4 ms, 46% of a 16 ms budget |
+
+So at 1080p the **server is not the constraint** (60 fps needs ~4% of it), and
+neither is the number of clients. The constraint is per client and it is the
+link, then the encoder:
+
+| operating point | wire per client | client CPU (one core) |
+|---|---|---|
+| streaming, 16 ms cadence | 3.7 MB/s desktop-like, **23.8 MB/s photographic** (≈30-190 Mbps up) | 1.05 cores to 6.8 cores |
+| Recall cadence, 3000 ms | 37 KB/s to 950 KB/s | ~3% of a core |
+
+That is the honest reason Recall collects a capture every few seconds instead of
+streaming: a client-server design at full framerate is bounded by the *uplink*
+(and by the encoder's CPU), not by the datacenter. The lever that changes both
+numbers is to send only what changed — RDPGFX `WIRE_TO_SURFACE` carries a
+destination rectangle per region and the broker already assembles multi-region
+frames, but the client does not yet compute dirty rectangles (DXGI
+`GetFrameDirtyRects`) and the broker does not composite regions into the stored
+desktop image (a multi-region frame is stored as a `.raw` region blob and
+reported as such, never as a corrupt `.jpg`).
+
+Two invariants keep a client honest at *both* operating points, and both are
+enforced by `precall-frame` and tested:
+
+* **bounded memory, drop-oldest.** The capture thread publishes into a
+  one-frame slot, not a queue: `published = taken + dropped + resident`, with
+  `resident <= 1`. A queue would turn a slow link into unbounded growth and a
+  stream showing a desktop from minutes ago. The heartbeat carries
+  `frames_dropped`, so link pressure is visible server-side instead of living in
+  client logs.
+* **one cadence policy.** `capture_interval_ms()` floors at 10 ms (100
+  captures/s) and passes anything else through, so `16` is streaming and `3000`
+  is Recall. (The client used to floor at 200 ms — a hard 5 captures/s ceiling
+  whatever was configured.)
+
 ## Repo layout
 
 ```
