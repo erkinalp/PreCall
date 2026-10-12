@@ -874,6 +874,8 @@ async fn switching_the_vector_backend_rebuilds_the_store() {
     }
 
     // Pass 2 reports a different backend: the store must be rebuilt, not kept.
+    // (Retry pacing is a minute, so simulate the next pass happening later.)
+    expire_retry_backoff(&fx);
     let ai_b = serve_ai("clip:stub-b@384").await;
     let stats = precall_api::enrich::enrich_once(&fx.data_root, &http_embedder(ai_b), 384, fx.key)
         .await
@@ -1183,4 +1185,198 @@ async fn a_text_only_retry_still_advances_the_queue_clock() {
         .unwrap();
     assert_eq!(third.text_embeddings, 2, "{third:?}");
     assert_eq!(processed_count(&fx), 0);
+}
+
+// ---------------------------------------------------------------------------
+// Regressions from the Codex reviews of 9cbe177 and 64775ac.
+// ---------------------------------------------------------------------------
+
+/// A malformed 200 response must not destroy the index on its way to a
+/// dimension error: validate first, mutate never.
+#[tokio::test]
+async fn a_malformed_embedding_leaves_the_store_intact() {
+    let fx = seed();
+    // A good store from a previous run.
+    image_index_in_space(&fx, "clip:good@384")
+        .insert(
+            &SemanticIndex::item_id_for_capture(fx.id_a),
+            None,
+            None,
+            &vec![0.0f32; 384],
+        )
+        .unwrap();
+    image_index_in_space(&fx, "clip:good@384")
+        .set_space_id("clip:good@384")
+        .unwrap();
+
+    // The service answers 200 with an empty vector and no space (what
+    // `/embed/image` returns for an empty body, and what a broken build might
+    // return generally).
+    #[derive(Clone)]
+    struct S;
+    async fn empty_embedding() -> axum::Json<serde_json::Value> {
+        axum::Json(serde_json::json!({ "embedding": [], "dim": 384 }))
+    }
+    let app = axum::Router::new()
+        .route("/embed/image", post(empty_embedding))
+        .with_state(S);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await });
+
+    let stats = precall_api::enrich::enrich_once(&fx.data_root, &http_embedder(addr), 384, fx.key)
+        .await
+        .unwrap();
+    assert_eq!(stats.image_embeddings, 0, "{stats:?}");
+    assert_eq!(
+        stats.images_skipped, 1,
+        "the capture with no good embedding is reported, not attempted: {stats:?}"
+    );
+
+    let idx = image_index(&fx);
+    assert_eq!(idx.count().unwrap(), 1, "the good row must survive");
+    assert_eq!(
+        idx.space_id().unwrap().as_deref(),
+        Some("clip:good@384"),
+        "and the store must not have been relabelled by the malformed response"
+    );
+}
+
+/// A text route that is absent (404/501) leaves captures processed for that
+/// deployment — but when the route comes back, their OCR must still be indexed.
+#[tokio::test]
+async fn a_returning_text_route_requeues_processed_captures() {
+    let fx = seed();
+    // Pass 1: images work, /embed/text is not deployed.
+    #[derive(Clone)]
+    struct S;
+    async fn health_ok() -> axum::Json<serde_json::Value> {
+        axum::Json(serde_json::json!({
+            "status": "ok",
+            "text_space_id": "clip:text@384",
+            "image_space_id": "clip:text@384",
+        }))
+    }
+    async fn image_ok() -> axum::Json<serde_json::Value> {
+        let mut v = vec![0.0f32; 384];
+        v[0] = 1.0;
+        axum::Json(serde_json::json!({ "embedding": v, "space": "clip:text@384" }))
+    }
+    async fn text_absent() -> (axum::http::StatusCode, &'static str) {
+        (axum::http::StatusCode::NOT_FOUND, "no such route")
+    }
+    async fn text_ok() -> axum::Json<serde_json::Value> {
+        let mut v = vec![0.0f32; 384];
+        v[1] = 1.0;
+        axum::Json(serde_json::json!({ "embedding": v, "space": "clip:text@384" }))
+    }
+    let absent = axum::Router::new()
+        .route("/health", axum::routing::get(health_ok))
+        .route("/embed/image", post(image_ok))
+        .route("/embed/text", post(text_absent))
+        .with_state(S);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let absent_addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, absent).await });
+
+    let first = precall_api::enrich::enrich_once(&fx.data_root, &http_embedder(absent_addr), 384, fx.key)
+        .await
+        .unwrap();
+    assert_eq!(first.image_embeddings, 2, "{first:?}");
+    assert_eq!(first.text_embeddings, 0, "{first:?}");
+    assert_eq!(processed_count(&fx), 0, "nothing to do while the route is absent");
+
+    // Pass 2: the route ships. The already-processed captures must be re-queued.
+    let deployed = axum::Router::new()
+        .route("/health", axum::routing::get(health_ok))
+        .route("/embed/image", post(image_ok))
+        .route("/embed/text", post(text_ok))
+        .with_state(S);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let deployed_addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, deployed).await });
+
+    // The availability flag is read at the start of the pass, so the first
+    // pass after deployment re-queues. Retry pacing still applies to that
+    // re-queue, so the simulated pass happens a minute later.
+    expire_retry_backoff(&fx);
+    let second = precall_api::enrich::enrich_once(&fx.data_root, &http_embedder(deployed_addr), 384, fx.key)
+        .await
+        .unwrap();
+    assert!(second.text_embeddings >= 1, "the leg must resume: {second:?}");
+    assert_eq!(processed_count(&fx), 0, "and the captures finish");
+
+    // ...and the store now holds text embeddings again.
+    let text_index = SemanticIndex::open(
+        &fx.data_root.join(&fx.client).join("SemanticTextStore.db"),
+        384,
+        precall_store::SPACE_UNKNOWN,
+    )
+    .unwrap();
+    assert_eq!(text_index.count().unwrap(), 2);
+}
+
+/// Rank fusion must see more than the final result count from *every* leg: a
+/// capture ranked 2nd by both legs has to be able to beat a rank-1 hit from a
+/// single leg, which is only possible if the FTS window is deeper than `limit`.
+#[tokio::test]
+async fn fusion_combines_candidates_beyond_the_final_count() {
+    let fx = seed();
+    let space = "clip:pool@384";
+    // C outranks A lexically (the term twice); B has no lexical hit at all.
+    let ukg = Ukg::open(&fx.data_root.join(&fx.client).join("ukg.db")).unwrap();
+    let id_c = ukg
+        .insert_capture(&capture(
+            "scene-c.jpg",
+            "tok-c",
+            TS_B + 1,
+            "kerberos kerberos",
+            None,
+        ))
+        .unwrap();
+    drop(ukg);
+
+    // Semantic ranks, seeded by hand so the cosines are exact: A (0.95) is
+    // rank 1, B (0.9) rank 2, C (0.1) rank 3. With `limit = 1` the FTS
+    // window is what is under test: only a window deeper than the final
+    // count lets A collect both of its ranks and clear C's single rank-1
+    // FTS contribution.
+    let unit = |cos: f32, axis: usize| -> Vec<f32> {
+        let mut v = vec![0.0f32; 384];
+        v[0] = cos;
+        v[axis] = (1.0 - cos * cos).sqrt();
+        v
+    };
+    let text = SemanticIndex::open(
+        &fx.data_root.join(&fx.client).join("SemanticTextStore.db"),
+        384,
+        space,
+    )
+    .unwrap();
+    text.insert(&SemanticIndex::item_id_for_capture(fx.id_a), None, None, &unit(0.95, 1))
+        .unwrap();
+    text.insert(&SemanticIndex::item_id_for_capture(fx.id_b), None, None, &unit(0.9, 2))
+        .unwrap();
+    text.insert(&SemanticIndex::item_id_for_capture(id_c), None, None, &unit(0.1, 3))
+        .unwrap();
+    drop(text);
+
+    // The stub's query embedding is e0, and /health reports the same space.
+    let addr = serve(&fx, http_embedder(serve_ai(space).await)).await;
+    let r = reqwest::Client::new()
+        .post(format!("http://{addr}/api/v1/search"))
+        .json(&serde_json::json!({
+            "client": fx.client, "query": "kerberos", "mode": "hybrid", "limit": 1,
+        }))
+        .send()
+        .await
+        .unwrap();
+    let body: serde_json::Value = r.json().await.unwrap();
+    let results = body["results"].as_array().unwrap();
+    assert_eq!(results.len(), 1, "limit is respected after fusion: {body}");
+    assert_eq!(
+        results[0]["window_capture_id"],
+        serde_json::json!(fx.id_a),
+        "A is rank 2 in both legs and must combine to beat single-leg rank-1 hits: {body}"
+    );
 }

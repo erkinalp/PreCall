@@ -688,7 +688,6 @@ impl Ukg {
     /// it.
     pub fn reset_image_embedding_states(&self) -> Result<(), UkgError> {
         self.conn.execute("DELETE FROM \"PrecallImageEmbedding\"", [])?;
-        self.conn.execute("DELETE FROM \"PrecallEnrichAttempt\"", [])?;
         Ok(())
     }
 
@@ -697,7 +696,6 @@ impl Ukg {
     pub fn mark_all_unprocessed(&self) -> Result<(), UkgError> {
         self.conn
             .execute("UPDATE \"WindowCapture\" SET \"IsProcessed\" = 0", [])?;
-        self.conn.execute("DELETE FROM \"PrecallEnrichAttempt\"", [])?;
         Ok(())
     }
 

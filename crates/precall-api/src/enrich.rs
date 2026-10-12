@@ -201,6 +201,25 @@ async fn enrich_client(
             image_index.set_space_id(image_space)?;
         }
 
+        // A leg whose route was absent (404/501) left its captures processed for
+        // that deployment — nothing more could be done there. Now that the
+        // service answers `/health`, re-queue them, or their OCR text or
+        // screenshots would stay missing forever. If the route is still
+        // partially rolled out the leg re-sets the flag and this repeats at the
+        // retry cadence, which is bounded.
+        if spaces.is_some() {
+            if flag_set(&ukg, TEXT_UNAVAILABLE) {
+                ukg.set_config(TEXT_UNAVAILABLE, "0")?;
+                ukg.mark_all_unprocessed()?;
+                warn!(client, "text embedding service is back; re-queueing captures");
+            }
+            if flag_set(&ukg, IMAGE_UNAVAILABLE) {
+                ukg.set_config(IMAGE_UNAVAILABLE, "0")?;
+                ukg.reset_image_embedding_states()?;
+                warn!(client, "image embedding service is back; re-queueing captures");
+            }
+        }
+
         // Queue 1: already-processed captures with no image embedding (or a
         // pending one whose backoff has elapsed). Empty on a fresh install's
         // first pass.
@@ -231,7 +250,7 @@ async fn enrich_client(
             let leg = match step {
                 ImageStep::Embed { jpeg, attempts } => {
                     let outcome = embedder.embed_image(&jpeg).await;
-                    image_record(&ukg, &image_index, &client, wc_id, attempts, outcome, &mut stats)?
+                    image_record(&ukg, &image_index, &client, wc_id, attempts, dim, outcome, &mut stats)?
                 }
                 ImageStep::Settled(leg) => leg,
             };
@@ -260,6 +279,13 @@ async fn enrich_client(
             let mut text_retry = false;
             if !text.is_empty() && !text_index.has_item(&item)? {
                 match embedder.embed_text(&text).await {
+                    EmbedOutcome::Ok { embedding: emb, .. } if !usable(&emb, dim) => {
+                        warn!(
+                            client, wc_id,
+                            got = emb.len(), want = dim,
+                            "text embedder returned an unusable vector; store left untouched"
+                        );
+                    }
                     EmbedOutcome::Ok { embedding: emb, space } => {
                         if space_mismatch(&text_index, &space)? {
                             // The stored rows belonged to another embedder:
@@ -272,7 +298,12 @@ async fn enrich_client(
                         text_index.insert(&item, None, None, &emb)?;
                         stats.text_embeddings += 1;
                     }
-                    EmbedOutcome::Disabled => {}
+                    EmbedOutcome::Disabled => {
+                        // No text route in this deployment (an older rollout, or
+                        // a URL mismatch). The capture is processed for now, and
+                        // the flag makes its return re-queue the text leg.
+                        ukg.set_config(TEXT_UNAVAILABLE, "1")?;
+                    }
                     EmbedOutcome::Rejected => {
                         warn!(client, wc_id, "text embedder refused the input; marking processed")
                     }
@@ -300,7 +331,7 @@ async fn enrich_client(
                 match step {
                     ImageStep::Embed { jpeg, attempts } => {
                         let outcome = embedder.embed_image(&jpeg).await;
-                        image_record(&ukg, &image_index, &client, wc_id, attempts, outcome, &mut stats)?
+                        image_record(&ukg, &image_index, &client, wc_id, attempts, dim, outcome, &mut stats)?
                     }
                     ImageStep::Settled(leg) => leg,
                 }
@@ -329,6 +360,14 @@ async fn enrich_client(
 
         Ok(stats)
     }
+}
+
+/// A vector of the wrong width can never be stored or compared, so the caller
+/// must reject it *before* clearing or relabelling anything: a malformed 200
+/// response from the AI service used to destroy a good index on its way to a
+/// `DimMismatch`.
+fn usable(vec: &[f32], dim: usize) -> bool {
+    vec.len() == dim
 }
 
 /// Does `idx` hold vectors from a different space than `space`?
@@ -467,17 +506,36 @@ fn image_step(
 
 /// Record the embedder's verdict in `PrecallImageEmbedding` so the next pass
 /// knows whether this capture may be forgotten or must be retried.
+#[allow(clippy::too_many_arguments)]
 fn image_record(
     ukg: &Ukg,
     image_index: &SemanticIndex,
     client: &str,
     wc_id: i64,
     attempts: i64,
+    dim: usize,
     outcome: EmbedOutcome,
     stats: &mut EnrichStats,
 ) -> anyhow::Result<ImageLeg> {
     let now = precall_proto::time::filetime_now() as i64;
     match outcome {
+        // Validate before any mutation: see `usable`.
+        EmbedOutcome::Ok { embedding, .. } if !usable(&embedding, dim) => {
+            warn!(
+                client, wc_id,
+                got = embedding.len(), want = dim,
+                "image embedder returned an unusable vector; store and state left untouched"
+            );
+            ukg.set_image_embedding_state(
+                wc_id,
+                "skipped",
+                attempts + 1,
+                Some("embedder returned a wrong-width vector"),
+                now,
+            )?;
+            stats.images_skipped += 1;
+            Ok(ImageLeg::Terminal)
+        }
         EmbedOutcome::Ok { embedding, space } => {
             if space_mismatch(image_index, &space)? {
                 // Every row in there came from the previous embedder. Clear,
@@ -497,6 +555,8 @@ fn image_record(
             Ok(ImageLeg::Done)
         }
         EmbedOutcome::Disabled => {
+            // No image route here; record it so its return re-queues the leg.
+            ukg.set_config(IMAGE_UNAVAILABLE, "1")?;
             stats.images_skipped += 1;
             Ok(ImageLeg::Unavailable)
         }
@@ -529,7 +589,19 @@ fn image_record(
 /// Captures handled per queue per pass.
 const BATCH: i64 = 64;
 
-/// How long a failed image attempt waits before it is retried. Without this a
+/// `PrecallConfig` keys recording that a leg's route was absent (404/501) the
+/// last time it ran. Records stay processed in such a deployment — nothing more
+/// can be done here — but when the capability comes back the captures must be
+/// re-queued, or their OCR text/images would be missing forever.
+const TEXT_UNAVAILABLE: &str = "enrich.text_unavailable";
+const IMAGE_UNAVAILABLE: &str = "enrich.image_unavailable";
+
+/// Is a leg unavailable-by-configuration right now?
+fn flag_set(ukg: &Ukg, key: &str) -> bool {
+    matches!(ukg.get_config(key), Ok(Some(v)) if v == "1")
+}
+
+/// How long a failed attempt waits before it is retried. Without this a
 /// batch of stuck captures is re-attempted every poll interval and, because the
 /// queue is `LIMIT`ed, starves every later capture.
 const RETRY_BACKOFF_TICKS: i64 = 60 * 10_000_000; // 60s

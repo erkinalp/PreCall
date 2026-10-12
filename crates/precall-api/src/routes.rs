@@ -169,6 +169,20 @@ fn index_space_verdict(
     }
 }
 
+/// How much deeper each leg's candidate window is than the final result count.
+///
+/// Rank fusion needs the union of the legs' windows: a capture ranked just
+/// outside `limit` by one leg but inside it by another must still contribute
+/// both ranks, and with `limit = 20` an FTS rank of 21 combined with a semantic
+/// rank of 21 legitimately beats a rank-1 single-leg hit. Truncating each leg to
+/// `limit` before fusion discards that.
+const FUSION_POOL_FACTOR: i64 = 4;
+
+/// Candidate window per leg before fusion (the final truncation still applies).
+fn fusion_pool(limit: i64) -> i64 {
+    (limit * FUSION_POOL_FACTOR).clamp(limit, 500)
+}
+
 /// A semantic candidate with no positive similarity is not evidence of
 /// similarity: the flat cosine scan returns *every* stored item, so the
 /// zero/negative tail is the whole store, not a match.
@@ -268,6 +282,7 @@ async fn search(
 
     let db = client_db(&st, &body.client)?;
     let limit = body.limit.unwrap_or(20).clamp(1, 200);
+    let pool = fusion_pool(limit);
 
     let (start, end) = body
         .time_range
@@ -290,7 +305,7 @@ async fn search(
             start_100ns: start,
             end_100ns: end,
             app_filter: body.app_filter.clone(),
-            limit: Some(limit),
+            limit: Some(pool),
         };
         let mut ids = Vec::new();
         for h in db.search_fts(&opts)? {
@@ -316,11 +331,17 @@ async fn search(
                 match index_space_verdict(&idx, &space)? {
                     SpaceVerdict::Ok => {
                         let allowed = db.capture_ids_matching_filters(start, end, &body.app_filter)?;
-                        let found =
-                            idx.search(&qemb, (limit * 2) as usize, allowed.as_ref())?;
-                        absorb_semantic_leg(
-                            &mut hits, &mut leg_ranks, &mut legs, "text-semantic", &db, &found,
-                        )?;
+                        if qemb.len() != st.embedding_dim {
+                            notes.push(format!(
+                                "text-semantic leg skipped: the embedder returned {} values, the store holds {}",
+                                qemb.len(), st.embedding_dim
+                            ));
+                        } else {
+                            let found = idx.search(&qemb, pool as usize, allowed.as_ref())?;
+                            absorb_semantic_leg(
+                                &mut hits, &mut leg_ranks, &mut legs, "text-semantic", &db, &found,
+                            )?;
+                        }
                     }
                     SpaceVerdict::Mismatch(stored) => notes.push(format!(
                         "text-semantic leg skipped: SemanticTextStore.db was built with {stored}, \
@@ -352,9 +373,15 @@ async fn search(
                 )?;
                 match index_space_verdict(&idx, &space)? {
                     SpaceVerdict::Ok => {
+                        if emb.len() != st.embedding_dim {
+                            return Err(ApiError::Unavailable(format!(
+                                "the AI service returned {} values for this image, expected {}",
+                                emb.len(),
+                                st.embedding_dim
+                            )));
+                        }
                         let allowed = db.capture_ids_matching_filters(start, end, &body.app_filter)?;
-                        let found =
-                            idx.search(&emb, (limit * 2) as usize, allowed.as_ref())?;
+                        let found = idx.search(&emb, pool as usize, allowed.as_ref())?;
                         absorb_semantic_leg(
                             &mut hits, &mut leg_ranks, &mut legs, "image-semantic", &db, &found,
                         )?;
@@ -397,12 +424,19 @@ async fn search(
                 )?;
                 match index_space_verdict(&idx, &space)? {
                     SpaceVerdict::Ok => {
-                        let allowed = db.capture_ids_matching_filters(start, end, &body.app_filter)?;
-                        let found =
-                            idx.search(&emb, (limit * 2) as usize, allowed.as_ref())?;
-                        absorb_semantic_leg(
-                            &mut hits, &mut leg_ranks, &mut legs, "image-text", &db, &found,
-                        )?;
+                        if emb.len() != st.embedding_dim {
+                            notes.push(format!(
+                                "text→image leg skipped: the service returned {} values, the store holds {}",
+                                emb.len(), st.embedding_dim
+                            ));
+                        } else {
+                            let allowed =
+                                db.capture_ids_matching_filters(start, end, &body.app_filter)?;
+                            let found = idx.search(&emb, pool as usize, allowed.as_ref())?;
+                            absorb_semantic_leg(
+                                &mut hits, &mut leg_ranks, &mut legs, "image-text", &db, &found,
+                            )?;
+                        }
                     }
                     SpaceVerdict::Mismatch(stored) => notes.push(format!(
                         "text→image leg skipped: SemanticImageStore.db was built with {stored}, \
@@ -732,6 +766,15 @@ mod tests {
         let fused = reciprocal_rank_fusion(&[vec![1, 2], vec![2, 3]]);
         assert!(fused[&2] > fused[&1], "agreement must win");
         assert!(fused[&2] > fused[&3], "agreement must win");
+    }
+
+    /// Each leg must offer more than the final result count, or fusion cannot
+    /// see the candidates it is supposed to combine.
+    #[test]
+    fn each_leg_offers_a_deeper_window_than_the_final_count() {
+        assert!(fusion_pool(1) > 1);
+        assert_eq!(fusion_pool(20), 80);
+        assert_eq!(fusion_pool(400), 500, "clamped like the FTS limit");
     }
 
     #[test]

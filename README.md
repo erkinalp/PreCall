@@ -91,8 +91,13 @@ exact lexical match. Within a leg, a semantic candidate with no positive
 similarity is dropped — the flat scan returns every stored item, so the
 zero/negative tail is the whole store, not a match.
 
-`time_range` and `app_filter` apply to **every** leg, including `mode=image`
-where there is no FTS leg to apply them instead.
+`time_range` and `app_filter` apply to **every** leg — and they are applied
+*during* each leg's scan, not to an already-truncated top-k, so an eligible
+capture that ranks below the cut is still found. Each leg offers a window four
+times deeper than the final result count before fusion (capped at the FTS
+limit), because rank fusion needs the union of the legs' candidate windows: a
+capture ranked just outside `limit` by one leg and inside it by another must
+still combine both ranks.
 
 A search that needs the AI service reports its state honestly: `notes` names a
 leg that could not run, and an image query returns **503** while the service is
