@@ -58,7 +58,7 @@ pub async fn run(cfg: ClientConfig, mut stop: watch::Receiver<bool>) -> Result<(
     // Capture + audio threads live for the whole run. Frames do **not** buffer:
     // the capture thread overwrites a single slot, so a slow pipeline drops
     // frames instead of accumulating a backlog (and a desktop from minutes ago).
-    let frames = spawn_capture(0, |e| tracing::warn!("capture thread: {e}"));
+    let mut frames = spawn_capture(0, |e| tracing::warn!("capture thread: {e}"));
     let audio_rx = if cfg.enable_audio {
         Some(spawn_loopback(audio_stop.clone()))
     } else {
@@ -67,18 +67,9 @@ pub async fn run(cfg: ClientConfig, mut stop: watch::Receiver<bool>) -> Result<(
 
     // Bridge the blocking slot into the runtime. Capacity 2 bounds memory at
     // slot(1) + channel(2) frames however fast the display updates.
-    let (frame_tx, mut frame_chan) = tokio::sync::mpsc::channel::<crate::dxgi::CaptureFrame>(2);
+    let mut frame_chan = frame_bridge(&frames);
     let (audio_tx, mut audio_chan) =
         tokio::sync::mpsc::channel::<crate::audio::AudioChunk>(8);
-    let frame_bridge = {
-        let frames = std::sync::Arc::clone(&frames);
-        tokio::task::spawn_blocking(move || loop {
-            let f = frames.recv();
-            if frame_tx.blocking_send(f).is_err() {
-                return;
-            }
-        })
-    };
     let audio_enabled = audio_rx.is_some();
     let audio_bridge = audio_rx.map(|rx| {
         tokio::task::spawn_blocking(move || loop {
@@ -104,6 +95,14 @@ pub async fn run(cfg: ClientConfig, mut stop: watch::Receiver<bool>) -> Result<(
     loop {
         if *stop.borrow() {
             break;
+        }
+        // A capture worker that exited (duplication lost, and the one recreate
+        // attempt failed) closes its slot; without this the client would keep
+        // reconnecting and heartbeating while capturing nothing at all.
+        if frames.is_closed() {
+            tracing::warn!("capture worker gone; restarting it");
+            frames = spawn_capture(0, |e| tracing::warn!("capture thread: {e}"));
+            frame_chan = frame_bridge(&frames);
         }
         let conn = match Connection::connect(&cfg).await {
             Ok(c) => {
@@ -294,11 +293,33 @@ pub async fn run(cfg: ClientConfig, mut stop: watch::Receiver<bool>) -> Result<(
     }
 
     audio_stop.store(true, Ordering::Relaxed);
-    frame_bridge.abort();
     if let Some(b) = audio_bridge {
         b.abort();
     }
     Ok(())
+}
+
+/// Pump the blocking latest-frame slot into the async send loop.
+///
+/// The returned receiver yields `None` exactly when the capture worker closes
+/// the slot, which is the signal that the loop must abandon this session.
+fn frame_bridge(
+    frames: &std::sync::Arc<precall_frame::LatestSlot<crate::dxgi::CaptureFrame>>,
+) -> tokio::sync::mpsc::Receiver<crate::dxgi::CaptureFrame> {
+    let (tx, rx) = tokio::sync::mpsc::channel(2);
+    let slot = std::sync::Arc::clone(frames);
+    tokio::task::spawn_blocking(move || loop {
+        match slot.recv() {
+            Some(f) => {
+                if tx.blocking_send(f).is_err() {
+                    return;
+                }
+            }
+            // Producer gone: dropping the sender wakes the select arm.
+            None => return,
+        }
+    });
+    rx
 }
 
 /// Non-blocking read of the next control message on the wire.

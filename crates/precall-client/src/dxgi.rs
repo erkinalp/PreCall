@@ -195,6 +195,7 @@ pub fn spawn_capture(
                 Ok(d) => d,
                 Err(e) => {
                     on_error(e);
+                    producer.close();
                     return;
                 }
             };
@@ -211,6 +212,10 @@ pub fn spawn_capture(
                             }
                             Err(e2) => {
                                 on_error(e2);
+                                // Close before returning: otherwise the send
+                                // loop blocks forever on a slot nobody fills,
+                                // still heartbeating, capturing nothing.
+                                producer.close();
                                 return;
                             }
                         }

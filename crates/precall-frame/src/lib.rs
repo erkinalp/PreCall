@@ -32,6 +32,7 @@ pub struct LatestSlot<T> {
     ready: Condvar,
     published: AtomicU64,
     dropped: AtomicU64,
+    closed: std::sync::atomic::AtomicBool,
 }
 
 impl<T> Default for LatestSlot<T> {
@@ -47,12 +48,29 @@ impl<T> LatestSlot<T> {
             ready: Condvar::new(),
             published: AtomicU64::new(0),
             dropped: AtomicU64::new(0),
+            closed: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    /// Mark the producer gone. A waiting [`LatestSlot::recv`] returns `None`
+    /// instead of blocking forever — without this, a capture thread that died
+    /// (duplication lost and not recoverable) left the send loop blocked on a
+    /// slot nobody would ever fill, still heartbeating, capturing nothing.
+    pub fn close(&self) {
+        self.closed.store(true, Ordering::SeqCst);
+        self.ready.notify_all();
+    }
+
+    pub fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::SeqCst)
     }
 
     /// Publish a frame, replacing (and counting) any frame the consumer has not
     /// taken yet.
     pub fn publish(&self, frame: T) {
+        if self.is_closed() {
+            return;
+        }
         let mut slot = self.slot.lock().unwrap();
         if slot.is_some() {
             self.dropped.fetch_add(1, Ordering::Relaxed);
@@ -64,11 +82,17 @@ impl<T> LatestSlot<T> {
     }
 
     /// Block until a frame is available, then take it.
-    pub fn recv(&self) -> T {
+    ///
+    /// `None` means the producer closed the slot — the caller must stop, not
+    /// wait for a frame that is never coming.
+    pub fn recv(&self) -> Option<T> {
         let mut slot = self.slot.lock().unwrap();
         loop {
             if let Some(frame) = slot.take() {
-                return frame;
+                return Some(frame);
+            }
+            if self.is_closed() {
+                return None;
             }
             slot = self.ready.wait(slot).unwrap();
         }
@@ -91,38 +115,47 @@ impl<T> LatestSlot<T> {
     }
 }
 
-/// Bytes of BGRA to sample per fingerprint. 64 gives one byte per 256
-/// pixels — 32 KiB of a 1080p frame instead of 8 MiB.
-pub const FRAME_HASH_STRIDE: usize = 64;
+/// Mixing constant for the word-wise fingerprint (golden ratio / xxHash prime).
+const MIX_A: u64 = 0x9E37_79B9_7F4A_7C15;
+const MIX_B: u64 = 0xBF58_476D_1CE4_E5B9;
 
-/// Fingerprint a BGRA frame by sampling it on a fixed stride.
+/// Fingerprint a BGRA frame **exactly**: every byte participates.
 ///
-/// Used only to skip frames that are byte-identical to the previous capture
-/// (DXGI can redeliver the same desktop around mode changes). Sampling cannot
-/// miss a *real* change in practice — a screenful of pixels that matches on
-/// every 64th byte would have to differ in fewer than 1/64 of its bytes — and
-/// it keeps the per-tick cost flat instead of proportional to resolution.
+/// An earlier version sampled one byte every 64. That is wrong, not merely
+/// approximate: a 1920-pixel BGRA row is 7680 bytes, a multiple of 64, so the
+/// stride landed on the *same* byte of the same sub-pixel column in every row
+/// (always the blue channel). A red- or green-only change confined to the
+/// unsampled pixels produced an identical fingerprint, and the capture loop
+/// treated a real screen update as "unchanged" and never recorded it.
+///
+/// This fold reads 8 bytes at a time, so it costs a few operations per word
+/// rather than per byte and is still a whole-buffer function (see
+/// `examples/client_cost.rs` for the measured cost against the byte-wise
+/// baseline).
 pub fn frame_fingerprint(bgra: &[u8]) -> u64 {
-    fingerprint_strided(bgra, FRAME_HASH_STRIDE)
-}
-
-/// [`frame_fingerprint`] with an explicit stride, for measurement.
-pub fn fingerprint_strided(bgra: &[u8], stride: usize) -> u64 {
-    let stride = stride.max(1);
-    // FNV-1a over the sampled bytes.
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    let mut i = 0usize;
-    while i < bgra.len() {
-        h ^= bgra[i] as u64;
-        h = h.wrapping_mul(0x0000_0100_0000_01b3);
-        i += stride;
+    for w in bgra.as_chunks::<8>().0 {
+        let word = u64::from_le_bytes(*w);
+        h ^= word.wrapping_mul(MIX_A);
+        h = h.rotate_left(31).wrapping_mul(MIX_B);
+    }
+    // The tail (a BGRA buffer is usually 8-byte aligned, but do not assume).
+    for &b in bgra.as_chunks::<8>().1 {
+        h ^= b as u64;
+        h = h.rotate_left(13).wrapping_mul(MIX_A);
     }
     h
 }
 
-/// The fingerprint of a whole buffer — the cost baseline this replaces.
+/// Byte-at-a-time fold — the slow baseline, kept so the harness can price the
+/// exact fingerprint against the obvious implementation.
 pub fn fingerprint_full(bgra: &[u8]) -> u64 {
-    fingerprint_strided(bgra, 1)
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for &b in bgra {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
 }
 
 /// Hard floor on the capture cadence: 100 captures/s. A zero interval would
@@ -167,8 +200,24 @@ mod tests {
         // One frame in memory, 999 overwritten — not a 1000-frame backlog.
         assert_eq!(slot.published(), 1000);
         assert_eq!(slot.dropped(), 999);
-        assert_eq!(slot.recv(), 999, "the consumer gets the newest, not the oldest");
+        assert_eq!(slot.recv(), Some(999), "the consumer gets the newest");
         assert!(slot.try_recv().is_none());
+    }
+
+    #[test]
+    fn a_closed_slot_wakes_its_consumer_instead_of_hanging() {
+        let slot = Arc::new(LatestSlot::<u32>::new());
+        let consumer = {
+            let slot = Arc::clone(&slot);
+            std::thread::spawn(move || slot.recv())
+        };
+        std::thread::sleep(Duration::from_millis(20));
+        slot.close();
+        assert_eq!(consumer.join().unwrap(), None, "a dead producer must not hang the bridge");
+        // Publishing after close changes nothing.
+        slot.publish(1);
+        assert_eq!(slot.published(), 0);
+        assert_eq!(slot.recv(), None);
     }
 
     #[test]
@@ -213,25 +262,43 @@ mod tests {
                 slot.publish(7u32);
             })
         };
-        assert_eq!(slot.recv(), 7);
+        assert_eq!(slot.recv(), Some(7));
         producer.join().unwrap();
     }
 
     #[test]
-    fn fingerprint_is_stable_and_stride_sensitive() {
-        // 1 MiB of BGRA is enough to exercise the stride pattern.
-        let frame: Vec<u8> = (0..(1 << 20)).map(|i| (i % 251) as u8).collect();
-        assert_eq!(frame_fingerprint(&frame), frame_fingerprint(&frame));
-        // A one-byte change off-stride is invisible to the sampled form and
-        // visible to the full one — documented, not accidental.
-        let mut off_stride = frame.clone();
-        off_stride[1] ^= 0xFF;
-        assert_eq!(frame_fingerprint(&frame), frame_fingerprint(&off_stride));
-        assert_ne!(fingerprint_full(&frame), fingerprint_full(&off_stride));
-        // A change *on* the stride is always seen.
-        let mut on_stride = frame.clone();
-        on_stride[0] ^= 0xFF;
-        assert_ne!(frame_fingerprint(&frame), frame_fingerprint(&on_stride));
+    fn fingerprint_is_exact_at_1920px_row_width() {
+        // A realistic 1080p BGRA buffer: 7680-byte rows.
+        let (w, h) = (1920usize, 8usize);
+        let mut frame = vec![0u8; w * h * 4];
+        for (i, b) in frame.iter_mut().enumerate() {
+            *b = (i % 251) as u8;
+        }
+        let base = frame_fingerprint(&frame);
+        assert_eq!(base, frame_fingerprint(&frame));
+
+        // A red-only change at a pixel a 64-byte stride would never look at.
+        // (The stride landed on the same blue byte of every 16th pixel, so this
+        // was invisible — a real screen update treated as "unchanged".)
+        let mut red_only = frame.clone();
+        red_only[4 * 7 + 2] ^= 0xFF;
+        assert_ne!(base, frame_fingerprint(&red_only), "a red-only change is a change");
+
+        // Green-only, and a single-pixel change, likewise.
+        let mut green_only = frame.clone();
+        green_only[4 * 7 + 1] ^= 0xFF;
+        assert_ne!(base, frame_fingerprint(&green_only));
+        let mut one_pixel = frame.clone();
+        one_pixel[4 * 1000 + 0] ^= 0x01;
+        assert_ne!(base, frame_fingerprint(&one_pixel));
+
+        // Order matters: swapping two words must not cancel out.
+        let mut swapped = frame.clone();
+        let (a, b) = (4usize, 4 + 8);
+        for k in 0..8 {
+            swapped.swap(a + k, b + k);
+        }
+        assert_ne!(base, frame_fingerprint(&swapped), "not a commutative fold");
     }
 
     #[test]

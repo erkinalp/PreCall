@@ -13,9 +13,7 @@
 //!
 //! Run: `cargo run --release -p precall-frame --example client_cost`
 
-use precall_frame::{
-    capture_interval_ms, fingerprint_full, fingerprint_strided, FRAME_HASH_STRIDE,
-};
+use precall_frame::{capture_interval_ms, fingerprint_full, frame_fingerprint};
 use std::io::Cursor;
 use std::time::{Duration, Instant};
 
@@ -87,22 +85,22 @@ fn main() {
     println!("PreCall client-side per-frame cost at {w}x{h} ({frame_bytes:.1} MiB BGRA)\n");
 
     // --- fingerprinting -----------------------------------------------------
-    let full = time(20, || fingerprint_full(&bgra));
-    let sampled = time(200, || fingerprint_strided(&bgra, FRAME_HASH_STRIDE));
-    println!(
-        "fingerprint   full buffer {:>8.3} ms/frame ({:>7.0} MB/s)  |  sampled 1/{} {:>8.4} ms ({:>7.1}x cheaper)",
-        full.as_secs_f64() * 1000.0,
-        frame_bytes / full.as_secs_f64(),
-        FRAME_HASH_STRIDE,
-        sampled.as_secs_f64() * 1000.0,
-        full.as_secs_f64() / sampled.as_secs_f64(),
-    );
+    // `frame_fingerprint` must be *exact* (a sampled stride aliased against the
+    // 1920-px row width and deduped real changes away), so it is compared
+    // against the byte-at-a-time baseline rather than against a sampled one.
+    let bytewise = time(20, || fingerprint_full(&bgra));
+    let exact = time(200, || frame_fingerprint(&bgra));
     let budget_at_60 = Duration::from_millis(16);
     println!(
-        "              full-buffer hash alone spends {:.0}% of a 16 ms frame budget ({:.0}% of it at {:.0} fps)",
-        full.as_secs_f64() / budget_at_60.as_secs_f64() * 100.0,
-        full.as_secs_f64() / budget_at_60.as_secs_f64() * 100.0,
-        1000.0 / capture_interval_ms(16) as f64,
+        "fingerprint   exact, word-wise {:>8.3} ms/frame ({:>7.0} MB/s, {:>4.1}% of a 16 ms budget)",
+        exact.as_secs_f64() * 1000.0,
+        frame_bytes / exact.as_secs_f64(),
+        exact.as_secs_f64() / budget_at_60.as_secs_f64() * 100.0,
+    );
+    println!(
+        "              byte-at-a-time  {:>8.3} ms/frame ({:>7.1}x slower; every byte participates in both)",
+        bytewise.as_secs_f64() * 1000.0,
+        bytewise.as_secs_f64() / exact.as_secs_f64(),
     );
 
     // --- JPEG encode (what the client sends) --------------------------------

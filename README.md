@@ -152,7 +152,7 @@ real handshake, real RDPGFX framing, AES-GCM at rest):
 | broker ingest, plaintext objects | 3072 captures/s | at-rest encryption costs ~51% of throughput |
 | `put` + `insert_capture` | ~1980 captures/s combined | store alone never the ceiling |
 | client JPEG q80, desktop-like | 57 ms/frame → **17 fps per core** | photographic: 116 ms → 8.6 fps, 2.8 MiB/frame |
-| client dedup fingerprint | 0.12 ms/frame (sampled 1/64) | full-buffer hashing would be 7.4 ms, 46% of a 16 ms budget |
+| client dedup fingerprint | 1.18 ms/frame exact (7.4% of a 16 ms budget) | byte-at-a-time would be 7.5 ms; a *sampled* stride was cheaper but wrong (see below) |
 
 So at 1080p the **server is not the constraint** (60 fps needs ~4% of it), and
 neither is the number of clients. The constraint is per client and it is the
@@ -186,6 +186,16 @@ enforced by `precall-frame` and tested:
   captures/s) and passes anything else through, so `16` is streaming and `3000`
   is Recall. (The client used to floor at 200 ms — a hard 5 captures/s ceiling
   whatever was configured.)
+* **fingerprinting is exact, not sampled.** An earlier revision sampled one
+  byte per 64; because a 1920-pixel BGRA row is 7680 bytes (a multiple of 64)
+  the stride landed on the same blue byte of the same columns in every row, so a
+  red- or green-only update could fingerprint identically and be deduped away —
+  a real screen change never recorded. The word-wise fold reads every byte for
+  1.18 ms/frame.
+* **a dead capture worker is visible.** `LatestSlot::close()` wakes the bridge,
+  drops the sender and ends the session, so a client whose duplication was lost
+  cannot keep heartbeating while capturing nothing (the run loop restarts the
+  worker on its next pass).
 
 ## Repo layout
 
