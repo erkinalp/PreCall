@@ -57,6 +57,17 @@ pub struct EnrichStats {
     pub texts_pending: usize,
 }
 
+impl EnrichStats {
+    fn absorb(&mut self, other: EnrichStats) {
+        self.text_embeddings += other.text_embeddings;
+        self.image_embeddings += other.image_embeddings;
+        self.backfilled += other.backfilled;
+        self.images_skipped += other.images_skipped;
+        self.images_pending += other.images_pending;
+        self.texts_pending += other.texts_pending;
+    }
+}
+
 /// How one capture's image leg ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ImageLeg {
@@ -97,7 +108,8 @@ pub fn spawn_enricher(
 /// One pass over every client store under `data_root`.
 ///
 /// Public so tests can drive a pass deterministically instead of racing the
-/// poller.
+/// poller. A failure on one client is logged and the pass continues: one
+/// unreadable store must not stop every other client's enrichment.
 pub async fn enrich_once(
     data_root: &Path,
     embedder: &Embedder,
@@ -120,6 +132,26 @@ pub async fn enrich_once(
     }
 
     for dir in dirs {
+        match enrich_client(&dir, embedder, dim, object_key, spaces.as_ref()).await {
+            Ok(client_stats) => stats.absorb(client_stats),
+            Err(e) => warn!(client = %dir.display(), "enrichment failed for this client: {e}"),
+        }
+    }
+
+    Ok(stats)
+}
+
+/// Enrichment for one client directory.
+async fn enrich_client(
+    dir: &Path,
+    embedder: &Embedder,
+    dim: usize,
+    object_key: [u8; 32],
+    spaces: Option<&(String, String)>,
+) -> anyhow::Result<EnrichStats> {
+    {
+        let mut stats = EnrichStats::default();
+
         // The client id is the directory name, exactly as the broker wrote it.
         let client = dir
             .file_name()
@@ -174,19 +206,12 @@ pub async fn enrich_once(
         // first pass.
         let backfill = ukg.captures_needing_image_embedding(BATCH, now, RETRY_BACKOFF_TICKS)?;
 
-        // Queue 2: fresh captures — both legs inline.
-        let fresh: Vec<(i64, Option<i64>, Option<String>)> = {
-            let mut stmt = ukg.conn().prepare(
-                "SELECT \"Id\",\"TimeStamp\",\"ImageToken\" FROM \"WindowCapture\"
-                 WHERE \"IsProcessed\" = 0 ORDER BY \"Id\" LIMIT ?",
-            )?;
-            let rows = stmt
-                .query_map([BATCH], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
-                .collect::<Result<Vec<_>, _>>()?;
-            rows
-        };
+        // Queue 2: fresh captures — both legs inline, paced like the backfill
+        // queue so a run of captures that cannot complete does not starve every
+        // later capture of enrichment.
+        let fresh = ukg.captures_pending_enrichment(BATCH, now, RETRY_BACKOFF_TICKS)?;
         if backfill.is_empty() && fresh.is_empty() {
-            continue;
+            return Ok(stats);
         }
 
         // --- Queue 1: backfill / retry (image leg only) ---------------------
@@ -204,7 +229,7 @@ pub async fn enrich_once(
             let leg = match step {
                 ImageStep::Embed { jpeg, attempts } => {
                     let outcome = embedder.embed_image(&jpeg).await;
-                    image_record(&ukg, &image_index, wc_id, attempts, outcome, &mut stats)?
+                    image_record(&ukg, &image_index, &client, wc_id, attempts, outcome, &mut stats)?
                 }
                 ImageStep::Settled(leg) => leg,
             };
@@ -233,8 +258,12 @@ pub async fn enrich_once(
             if !text.is_empty() && !text_index.has_item(&item)? {
                 match embedder.embed_text(&text).await {
                     EmbedOutcome::Ok { embedding: emb, space } => {
+                        if ensure_space(&text_index, &space)? {
+                            // The stored rows belonged to another embedder.
+                            ukg.mark_all_unprocessed()?;
+                            warn!(client, "text store held another embedding space; rebuilt it");
+                        }
                         text_index.insert(&item, None, None, &emb)?;
-                        text_index.set_space_id(&space)?;
                         stats.text_embeddings += 1;
                     }
                     EmbedOutcome::Disabled => {}
@@ -265,11 +294,20 @@ pub async fn enrich_once(
                 match step {
                     ImageStep::Embed { jpeg, attempts } => {
                         let outcome = embedder.embed_image(&jpeg).await;
-                        image_record(&ukg, &image_index, wc_id, attempts, outcome, &mut stats)?
+                        image_record(&ukg, &image_index, &client, wc_id, attempts, outcome, &mut stats)?
                     }
                     ImageStep::Settled(leg) => leg,
                 }
             } else {
+                // Recorded so the queue has a timestamp to pace against; this
+                // capture can never produce an image embedding.
+                ukg.set_image_embedding_state(
+                    wc_id,
+                    "skipped",
+                    1,
+                    Some("no image token"),
+                    now,
+                )?;
                 stats.images_skipped += 1;
                 ImageLeg::Terminal
             };
@@ -282,9 +320,27 @@ pub async fn enrich_once(
                 ukg.mark_processed(wc_id)?;
             }
         }
-    }
 
-    Ok(stats)
+        Ok(stats)
+    }
+}
+
+/// Make `idx` the store for `space`, clearing it first when it holds another
+/// space's vectors. Returns `true` when a rebuild happened.
+///
+/// The per-pass `/health` check cannot be the only guard: `/health` can fail
+/// while `/embed/image` succeeds moments later (the service recovered, or was
+/// rolled forward), and inserting that vector into a store stamped with the
+/// previous space and then relabelling it would leave a permanently mixed,
+/// incomparable index that every later query accepts.
+fn ensure_space(idx: &SemanticIndex, space: &str) -> anyhow::Result<bool> {
+    let stored = idx.space_id()?;
+    let rebuilt = matches!(stored.as_deref(), Some(s) if s != space && s != precall_store::SPACE_UNKNOWN);
+    if rebuilt {
+        idx.clear()?;
+    }
+    idx.set_space_id(space)?;
+    Ok(rebuilt)
 }
 
 /// What to do with one capture's image leg, decided without any `await`.
@@ -318,6 +374,15 @@ fn image_step(
     // Restart safety: an insert that succeeded before a crash must not be
     // repeated, whatever the state row says.
     if image_index.has_item(&item)? {
+        // ...but the *state row* may be missing (the process stopped between
+        // the index commit and this write). Record it now, or the capture is
+        // selected as state-less work on every future pass.
+        let prior = ukg.image_embedding_state(wc_id)?;
+        if prior.as_ref().map(|(s, _, _)| s.as_str()) != Some("done") {
+            let attempts = prior.as_ref().map(|(_, a, _)| *a).unwrap_or(0);
+            let now = precall_proto::time::filetime_now() as i64;
+            ukg.set_image_embedding_state(wc_id, "done", attempts, None, now)?;
+        }
         return Ok(ImageStep::Settled(ImageLeg::Done));
     }
 
@@ -372,7 +437,29 @@ fn image_step(
         return Ok(ImageStep::Settled(ImageLeg::Retry));
     }
 
-    let jpeg = objects.get(client, &rel, token)?;
+    let jpeg = match objects.get(client, &rel, token) {
+        Ok(b) => b,
+        Err(e) => {
+            // A single unreadable object must not abort the pass (that would
+            // re-select the same capture forever and stall every client after
+            // it). Corrupt ciphertext never becomes readable, so it is
+            // terminal; a racing delete or transient I/O is retryable.
+            let terminal = matches!(e, precall_store::objects::ObjectError::Crypto(_));
+            let (state, note) = if terminal {
+                ("skipped", "object unreadable (ciphertext/decrypt failure)")
+            } else {
+                ("pending", "object unreadable (missing or I/O)")
+            };
+            ukg.set_image_embedding_state(wc_id, state, attempts + 1, Some(&e.to_string()), now)?;
+            if terminal {
+                stats.images_skipped += 1;
+                return Ok(ImageStep::Settled(ImageLeg::Terminal));
+            }
+            let _ = note;
+            stats.images_pending += 1;
+            return Ok(ImageStep::Settled(ImageLeg::Retry));
+        }
+    };
     Ok(ImageStep::Embed { jpeg, attempts })
 }
 
@@ -381,6 +468,7 @@ fn image_step(
 fn image_record(
     ukg: &Ukg,
     image_index: &SemanticIndex,
+    client: &str,
     wc_id: i64,
     attempts: i64,
     outcome: EmbedOutcome,
@@ -389,9 +477,14 @@ fn image_record(
     let now = precall_proto::time::filetime_now() as i64;
     match outcome {
         EmbedOutcome::Ok { embedding, space } => {
+            if ensure_space(image_index, &space)? {
+                // Every row in there came from the previous embedder; the
+                // captures that produced them must be queued again.
+                ukg.reset_image_embedding_states()?;
+                warn!(client, wc_id, "image store held another embedding space; rebuilt it");
+            }
             let item = SemanticIndex::item_id_for_capture(wc_id);
             image_index.insert(&item, None, None, &embedding)?;
-            image_index.set_space_id(&space)?;
             ukg.set_image_embedding_state(wc_id, "done", attempts + 1, None, now)?;
             stats.image_embeddings += 1;
             Ok(ImageLeg::Done)

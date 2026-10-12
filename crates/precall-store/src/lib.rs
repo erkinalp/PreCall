@@ -22,5 +22,6 @@ pub use objects::ObjectStore;
 pub use schema::UKG_SCHEMA;
 pub use semantic::{EmbeddingHit, SemanticIndex, SPACE_UNKNOWN};
 pub use ukg::{
-    AppDwellEntry, SearchHit, SearchOptions, TimelineEntry, Ukg, WebDwellEntry,
+    AppDwellEntry, PendingCapture, QueuedCapture, SearchHit, SearchOptions, TimelineEntry, Ukg,
+    WebDwellEntry,
 };

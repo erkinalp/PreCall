@@ -411,6 +411,18 @@ fn http_embedder(addr: SocketAddr) -> Embedder {
     }
 }
 
+/// Move every recorded attempt a couple of minutes into the past, i.e. "the
+/// service came back after the retry backoff elapsed".
+fn expire_retry_backoff(fx: &Fixture) {
+    let ukg = Ukg::open(&fx.data_root.join(&fx.client).join("ukg.db")).unwrap();
+    ukg.conn()
+        .execute(
+            "UPDATE \"PrecallImageEmbedding\" SET \"UpdatedAt\" = \"UpdatedAt\" - ?",
+            [120 * 10_000_000i64],
+        )
+        .unwrap();
+}
+
 fn processed_count(fx: &Fixture) -> i64 {
     let ukg = Ukg::open(&fx.data_root.join(&fx.client).join("ukg.db")).unwrap();
     ukg.conn()
@@ -467,7 +479,16 @@ async fn transient_image_embedding_failures_are_retried() {
     );
     drop(ukg);
 
-    // Service recovers: the same captures embed, exactly once.
+    // A pass moments later must not hammer the service again: the retry is
+    // inside its backoff window.
+    let immediate = precall_api::enrich::enrich_once(&fx.data_root, &Embedder::Local, 384, fx.key)
+        .await
+        .unwrap();
+    assert_eq!(immediate.image_embeddings, 0, "backoff must pace retries: {immediate:?}");
+    assert_eq!(immediate.images_pending, 0, "{immediate:?}");
+
+    // Service recovers, the backoff elapses: the same captures embed, once.
+    expire_retry_backoff(&fx);
     let second = precall_api::enrich::enrich_once(&fx.data_root, &Embedder::Local, 384, fx.key)
         .await
         .unwrap();
@@ -900,4 +921,172 @@ async fn queries_refuse_to_rank_against_a_different_space() {
         notes.iter().any(|n| n.as_str().unwrap().contains("clip:stub-a@384")),
         "the note must name the store's space: {notes:?}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Regressions from the Codex re-review of 310f1be.
+// ---------------------------------------------------------------------------
+
+/// A single unreadable object must be isolated, not abort the pass: aborting
+/// re-selects the same capture forever and stalls every client after it.
+#[tokio::test]
+async fn an_unreadable_object_is_isolated_not_fatal() {
+    let fx = seed();
+    // Corrupt A's stored ciphertext in place (bad authentication tag).
+    let rel = ObjectStore::key_path(&fx.client, ymd_from_filetime(TS_A as i64), "tok-a", "jpg");
+    let path = fx
+        .data_root
+        .join(&fx.client)
+        .join("objects")
+        .join(&rel);
+    let mut bytes = std::fs::read(&path).unwrap();
+    let n = bytes.len();
+    bytes[n - 1] ^= 0xFF;
+    std::fs::write(&path, &bytes).unwrap();
+
+    let stats = precall_api::enrich::enrich_once(&fx.data_root, &Embedder::Local, 384, fx.key)
+        .await
+        .expect("the pass must survive one bad object");
+    assert_eq!(stats.images_skipped, 1, "the corrupt object is terminal: {stats:?}");
+    assert_eq!(stats.image_embeddings, 1, "B is still embedded: {stats:?}");
+    assert_eq!(image_index(&fx).count().unwrap(), 1);
+
+    // Terminal means exactly that: later passes do not keep retrying it.
+    let again = precall_api::enrich::enrich_once(&fx.data_root, &Embedder::Local, 384, fx.key)
+        .await
+        .unwrap();
+    assert_eq!(again.image_embeddings, 0, "{again:?}");
+    assert_eq!(again.images_pending, 0, "{again:?}");
+}
+
+/// `/health` can fail while `/embed/image` succeeds (service recovered, or was
+/// rolled forward). Inserting that vector and relabelling the store would leave
+/// a permanently mixed index.
+#[tokio::test]
+async fn a_successful_embed_in_a_new_space_rebuilds_instead_of_mixing() {
+    let fx = seed();
+    // Store stamped with an earlier space, holding one stray row.
+    let idx = image_index_in_space(&fx, "clip:old@384");
+    idx.insert(
+        &SemanticIndex::item_id_for_capture(999),
+        None,
+        None,
+        &vec![0.0f32; 384],
+    )
+    .unwrap();
+    drop(idx);
+
+    // /health is down, /embed/image answers in a new space.
+    #[derive(Clone)]
+    struct S;
+    async fn health_down() -> (axum::http::StatusCode, &'static str) {
+        (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "health down")
+    }
+    async fn embed_image_new_space() -> axum::Json<serde_json::Value> {
+        let mut v = vec![0.0f32; 384];
+        v[0] = 1.0;
+        axum::Json(serde_json::json!({ "embedding": v, "space": "clip:new@384" }))
+    }
+    let app = axum::Router::new()
+        .route("/health", axum::routing::get(health_down))
+        .route("/embed/image", post(embed_image_new_space))
+        .with_state(S);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await });
+
+    let stats = precall_api::enrich::enrich_once(&fx.data_root, &http_embedder(addr), 384, fx.key)
+        .await
+        .unwrap();
+    assert_eq!(stats.image_embeddings, 2, "{stats:?}");
+    let idx = image_index(&fx);
+    assert_eq!(idx.space_id().unwrap().as_deref(), Some("clip:new@384"));
+    assert_eq!(
+        idx.count().unwrap(),
+        2,
+        "the old space's rows must be gone, not ranked alongside new ones"
+    );
+}
+
+/// 408/429/401/404 are deployment or transient states, not per-input refusals:
+/// marking them `skipped` would exclude screenshots forever.
+#[tokio::test]
+async fn service_wide_client_errors_stay_retryable() {
+    for code in [
+        axum::http::StatusCode::TOO_MANY_REQUESTS,
+        axum::http::StatusCode::REQUEST_TIMEOUT,
+        axum::http::StatusCode::UNAUTHORIZED,
+    ] {
+        let fx = seed();
+        let address = serve_status(code).await;
+        let stats = precall_api::enrich::enrich_once(&fx.data_root, &http_embedder(address), 384, fx.key)
+            .await
+            .unwrap();
+        assert_eq!(stats.images_pending, 2, "{code} must be retryable: {stats:?}");
+        assert_eq!(stats.images_skipped, 0, "{code} must not be terminal: {stats:?}");
+        let ukg = Ukg::open(&fx.data_root.join(&fx.client).join("ukg.db")).unwrap();
+        assert_eq!(
+            ukg.image_embedding_state(fx.id_a).unwrap().unwrap().0,
+            "pending",
+            "{code}"
+        );
+    }
+}
+
+/// A capture that cannot complete stays queued but is paced, so 64 of them
+/// cannot exclude every later capture from enrichment.
+#[tokio::test]
+async fn fresh_captures_are_paced_by_the_same_backoff() {
+    let fx = seed();
+    // No object on disk for either capture → the image leg stays retryable and
+    // the captures stay unprocessed.
+    std::fs::remove_dir_all(fx.data_root.join(&fx.client).join("objects")).unwrap();
+    let first = precall_api::enrich::enrich_once(&fx.data_root, &Embedder::Local, 384, fx.key)
+        .await
+        .unwrap();
+    assert_eq!(first.images_pending, 2, "{first:?}");
+    assert_eq!(processed_count(&fx), 2, "they stay queued");
+
+    // Immediately afterwards the queue is quiet (backoff), rather than
+    // re-attempting the same rows every poll.
+    let second = precall_api::enrich::enrich_once(&fx.data_root, &Embedder::Local, 384, fx.key)
+        .await
+        .unwrap();
+    assert_eq!(second.images_pending, 0, "paced: {second:?}");
+    assert_eq!(second.text_embeddings, 0, "and the text leg is not re-run either: {second:?}");
+}
+
+/// The index commit and the `PrecallImageEmbedding` write are separate
+/// databases; a crash between them must not leave a capture selected as
+/// state-less work forever.
+#[tokio::test]
+async fn an_existing_embedding_gets_its_state_recorded() {
+    let fx = seed();
+    let idx = image_index(&fx);
+    idx.insert(
+        &SemanticIndex::item_id_for_capture(fx.id_a),
+        None,
+        None,
+        &vec![0.0f32; 384],
+    )
+    .unwrap();
+    drop(idx);
+    // A's text leg is already done, so it is backfill-queue work with no state
+    // row — exactly the crash window.
+    let ukg = Ukg::open(&fx.data_root.join(&fx.client).join("ukg.db")).unwrap();
+    ukg.mark_processed(fx.id_a).unwrap();
+    assert!(ukg.image_embedding_state(fx.id_a).unwrap().is_none());
+    drop(ukg);
+
+    precall_api::enrich::enrich_once(&fx.data_root, &Embedder::Local, 384, fx.key)
+        .await
+        .unwrap();
+
+    let ukg = Ukg::open(&fx.data_root.join(&fx.client).join("ukg.db")).unwrap();
+    let (state, _, err) = ukg
+        .image_embedding_state(fx.id_a)
+        .unwrap()
+        .expect("the guard must record the state it verified");
+    assert_eq!(state, "done");
+    assert!(err.is_none());
 }

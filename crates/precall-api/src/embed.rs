@@ -51,6 +51,17 @@ impl EmbedOutcome {
     }
 }
 
+/// Is this status the service refusing *this input* (so retrying the same bytes
+/// is futile), or a service-wide condition that may clear on its own?
+///
+/// Only genuinely input-specific statuses are terminal. 408/429 are transient,
+/// 5xx is an outage, and 401/404 are configuration or rollout states that
+/// disappear once the deployment is fixed — treating those as refusals used to
+/// mark screenshots `skipped` permanently.
+fn is_input_refusal(status: reqwest::StatusCode) -> bool {
+    matches!(status.as_u16(), 400 | 413 | 415 | 422)
+}
+
 #[derive(Debug, Clone)]
 pub enum Embedder {
     /// `http://host:port` of the AI service.
@@ -130,10 +141,17 @@ impl Embedder {
                     }
                 };
                 let status = r.status();
-                if status.is_client_error() {
+                if is_input_refusal(status) {
                     return EmbedOutcome::Rejected;
                 }
                 if !status.is_success() {
+                    if status == reqwest::StatusCode::NOT_FOUND
+                        || status == reqwest::StatusCode::NOT_IMPLEMENTED
+                    {
+                        // The route itself is absent (wrong URL, older build).
+                        return EmbedOutcome::Disabled;
+                    }
+                    tracing::debug!("text embedder unavailable: {status}");
                     return EmbedOutcome::Retry;
                 }
                 match r.json::<Resp>().await {
@@ -183,7 +201,7 @@ impl Embedder {
                     }
                 };
                 let status = r.status();
-                if status.is_client_error() {
+                if is_input_refusal(status) {
                     // The service understood the request and refused this
                     // input (bad/oversized/undecodable frame) — retrying the
                     // same bytes cannot succeed.
@@ -191,6 +209,11 @@ impl Embedder {
                     return EmbedOutcome::Rejected;
                 }
                 if !status.is_success() {
+                    if status == reqwest::StatusCode::NOT_FOUND
+                        || status == reqwest::StatusCode::NOT_IMPLEMENTED
+                    {
+                        return EmbedOutcome::Disabled;
+                    }
                     tracing::debug!("image embedder unavailable: {status}");
                     return EmbedOutcome::Retry;
                 }
@@ -270,12 +293,14 @@ impl Embedder {
             }
         };
         let status = r.status();
-        // 501 is the service stating, permanently, that it has no CLIP stack —
-        // not an outage.
-        if status == reqwest::StatusCode::NOT_IMPLEMENTED {
+        // 501 (and 404 from an older service) states, permanently, that there
+        // is no CLIP text encoder here — a missing capability, not an outage.
+        if status == reqwest::StatusCode::NOT_IMPLEMENTED
+            || status == reqwest::StatusCode::NOT_FOUND
+        {
             return EmbedOutcome::Disabled;
         }
-        if status.is_client_error() {
+        if is_input_refusal(status) {
             return EmbedOutcome::Rejected;
         }
         if !status.is_success() {
@@ -381,8 +406,26 @@ mod tests {
         assert_ne!(a, b);
     }
 
-    /// A 4xx is the service refusing *this input*; a 5xx/transport failure is
-    /// the service being unavailable. The enricher depends on the difference.
+    /// Only input-specific statuses are terminal; transient and
+    /// deployment-level ones must stay retryable.
+    #[test]
+    fn only_input_specific_statuses_are_refusals() {
+        for code in [400u16, 413, 415, 422] {
+            assert!(
+                is_input_refusal(reqwest::StatusCode::from_u16(code).unwrap()),
+                "{code} should be a refusal"
+            );
+        }
+        for code in [401u16, 403, 404, 408, 429, 500, 502, 503] {
+            assert!(
+                !is_input_refusal(reqwest::StatusCode::from_u16(code).unwrap()),
+                "{code} must stay retryable"
+            );
+        }
+    }
+
+    /// A 4xx refusal is terminal; a 5xx/transport failure is an outage. The
+    /// enricher depends on the difference.
     #[tokio::test]
     async fn image_embed_outcome_separates_rejection_from_outage() {
         use axum::routing::post;

@@ -87,6 +87,15 @@ pub struct WebDwellEntry {
 }
 
 /// A per-client (or local-cache) `ukg.db`.
+/// One capture queued for the backfill/retry pass: `(Id, TimeStamp, ImageToken)`
+/// — the token is mandatory here, the query filters for it.
+pub type QueuedCapture = (i64, Option<i64>, String);
+
+/// One fresh capture awaiting enrichment: `(Id, TimeStamp, ImageToken)`, where
+/// the token may be absent (the image leg is then impossible and the state row
+/// records why).
+pub type PendingCapture = (i64, Option<i64>, Option<String>);
+
 pub struct Ukg {
     conn: Connection,
 }
@@ -625,7 +634,7 @@ impl Ukg {
         limit: i64,
         now: i64,
         backoff: i64,
-    ) -> Result<Vec<(i64, Option<i64>, String)>, UkgError> {
+    ) -> Result<Vec<QueuedCapture>, UkgError> {
         let mut stmt = self.conn.prepare(
             "SELECT w.\"Id\", w.\"TimeStamp\", w.\"ImageToken\"
              FROM \"WindowCapture\" w
@@ -633,6 +642,35 @@ impl Ukg {
              WHERE w.\"ImageToken\" IS NOT NULL
                AND w.\"IsProcessed\" = 1
                AND (e.\"State\" IS NULL OR e.\"State\" = 'pending')
+               AND (e.\"UpdatedAt\" IS NULL OR e.\"UpdatedAt\" <= ?)
+             ORDER BY COALESCE(e.\"UpdatedAt\", 0) ASC, w.\"Id\" ASC
+             LIMIT ?",
+        )?;
+        let rows = stmt.query_map(params![now - backoff, limit], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+        })?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// The fresh-capture queue: `IsProcessed = 0`, ordered and paced like the
+    /// backfill queue.
+    ///
+    /// A fresh capture can stay unprocessed because an *image* attempt failed
+    /// (the queue keeps it retryable) or because its text leg failed. Without
+    /// the same backoff and rotation the backfill queue has, 64 such captures
+    /// would be reselected every poll and every later capture would be starved
+    /// of enrichment entirely.
+    pub fn captures_pending_enrichment(
+        &self,
+        limit: i64,
+        now: i64,
+        backoff: i64,
+    ) -> Result<Vec<PendingCapture>, UkgError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT w.\"Id\", w.\"TimeStamp\", w.\"ImageToken\"
+             FROM \"WindowCapture\" w
+             LEFT JOIN \"PrecallImageEmbedding\" e ON e.\"WindowCaptureId\" = w.\"Id\"
+             WHERE w.\"IsProcessed\" = 0
                AND (e.\"UpdatedAt\" IS NULL OR e.\"UpdatedAt\" <= ?)
              ORDER BY COALESCE(e.\"UpdatedAt\", 0) ASC, w.\"Id\" ASC
              LIMIT ?",

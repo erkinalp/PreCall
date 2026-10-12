@@ -106,9 +106,13 @@ captures processed by an older, text-only build are **backfilled** from the
 stored screenshots, and a capture whose embedding failed while the AI service
 was down is **retried** rather than lost. Per-capture state lives in
 `PrecallImageEmbedding` (`pending`/`done`/`skipped`); `skipped` records why
-(no timestamp, non-JPEG frame, refused input) and is never retried. Retries
-back off for a minute and the queue is ordered least-recently-attempted first,
-so a handful of stuck captures cannot starve the rest of the backlog.
+(no timestamp, non-JPEG frame, refused input) and is never retried. **Both**
+queues back off for a minute and are ordered least-recently-attempted first, so
+a handful of stuck captures cannot starve the rest of the backlog. Only
+input-specific statuses (400/413/415/422) are terminal: 408/429, 5xx, transport
+failures and even 401/404 are retried, because those clear when the deployment
+is fixed. A read that fails is isolated to its own capture — one corrupt
+screenshot cannot stall a client's whole backlog.
 
 Embeddings carry the **vector space** that produced them (`space` on every
 `/embed/*` response, `*_space_id` on `/health`), and that id is stamped into
