@@ -422,43 +422,54 @@ impl Ukg {
         Ok(map)
     }
 
-    /// Subset of `ids` linked to an app whose `Path` or `Name` is in `filter` —
-    /// the same predicate [`Ukg::search_fts`] applies in SQL, exposed so the
-    /// semantic legs can apply the caller's filter too (in `mode=image` there
-    /// is no FTS leg to do it for them).
-    pub fn ids_matching_app_filter(
+    /// Every capture id inside the requested window/application filter, or
+    /// `None` when no filter is active.
+    ///
+    /// This exists so a **semantic** leg can filter *during* its scan. Filtering
+    /// an already-truncated top-k afterwards drops eligible matches that happen
+    /// to rank below the cut, and in `mode=image` there is no FTS leg to apply
+    /// the constraints instead.
+    pub fn capture_ids_matching_filters(
         &self,
-        ids: &[i64],
-        filter: &[String],
-    ) -> Result<std::collections::HashSet<i64>, UkgError> {
-        let mut out = std::collections::HashSet::new();
-        if ids.is_empty() || filter.is_empty() {
-            return Ok(out);
+        start_100ns: Option<i64>,
+        end_100ns: Option<i64>,
+        app_filter: &[String],
+    ) -> Result<Option<std::collections::HashSet<i64>>, UkgError> {
+        if start_100ns.is_none() && end_100ns.is_none() && app_filter.is_empty() {
+            return Ok(None);
         }
-        let id_marks = vec!["?"; ids.len()].join(",");
-        let app_marks = vec!["?"; filter.len()].join(",");
-        let sql = format!(
-            "SELECT DISTINCT r.\"WindowCaptureId\" FROM \"WindowCaptureAppRelation\" r
-             JOIN \"App\" a ON a.\"Id\" = r.\"AppId\"
-             WHERE (a.\"Path\" IN ({app_marks}) OR a.\"Name\" IN ({app_marks}))
-               AND r.\"WindowCaptureId\" IN ({id_marks})"
-        );
+        let mut sql = String::from("SELECT w.\"Id\" FROM \"WindowCapture\" w WHERE 1=1");
         let mut vals: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
-        for _ in 0..2 {
-            for f in filter {
+        if let Some(s) = start_100ns {
+            sql.push_str(" AND w.\"TimeStamp\" >= ?");
+            vals.push(Box::new(s));
+        }
+        if let Some(e) = end_100ns {
+            sql.push_str(" AND w.\"TimeStamp\" <= ?");
+            vals.push(Box::new(e));
+        }
+        if !app_filter.is_empty() {
+            let marks = vec!["?"; app_filter.len()].join(",");
+            sql.push_str(&format!(
+                " AND w.\"Id\" IN (SELECT r.\"WindowCaptureId\" FROM \"WindowCaptureAppRelation\" r
+                   JOIN \"App\" a ON a.\"Id\" = r.\"AppId\"
+                   WHERE a.\"Path\" IN ({marks}) OR a.\"Name\" IN ({marks}))"
+            ));
+            for f in app_filter {
                 vals.push(Box::new(f.clone()));
             }
-        }
-        for id in ids {
-            vals.push(Box::new(*id));
+            for f in app_filter {
+                vals.push(Box::new(f.clone()));
+            }
         }
         let refs: Vec<&dyn rusqlite::ToSql> = vals.iter().map(|v| v.as_ref()).collect();
         let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt.query_map(&refs[..], |r| r.get::<_, i64>(0))?;
+        let mut out = std::collections::HashSet::new();
         for row in rows {
             out.insert(row?);
         }
-        Ok(out)
+        Ok(Some(out))
     }
 
     pub fn app_dwell(&self) -> Result<Vec<AppDwellEntry>, UkgError> {        let mut stmt = self.conn.prepare(
@@ -605,12 +616,15 @@ impl Ukg {
     /// is already done — the backfill/retry queue.
     ///
     /// Excludes `IsProcessed = 0` rows on purpose: those are the enrichment
-    /// loop's *fresh* captures, which run the image leg inline. A capture that
-    /// failed transiently is left `pending` here and returns on the next pass;
-    /// one whose input was refused is `skipped` and never retried.
+    /// loop's *fresh* captures, which run the image leg inline. Ordering is
+    /// **least-recently-attempted first** and rows attempted within `backoff`
+    /// are skipped, so a batch of permanently stuck captures cannot monopolize
+    /// the queue and starve every later capture (the queue is `LIMIT`ed).
     pub fn captures_needing_image_embedding(
         &self,
         limit: i64,
+        now: i64,
+        backoff: i64,
     ) -> Result<Vec<(i64, Option<i64>, String)>, UkgError> {
         let mut stmt = self.conn.prepare(
             "SELECT w.\"Id\", w.\"TimeStamp\", w.\"ImageToken\"
@@ -619,12 +633,29 @@ impl Ukg {
              WHERE w.\"ImageToken\" IS NOT NULL
                AND w.\"IsProcessed\" = 1
                AND (e.\"State\" IS NULL OR e.\"State\" = 'pending')
-             ORDER BY w.\"Id\" LIMIT ?",
+               AND (e.\"UpdatedAt\" IS NULL OR e.\"UpdatedAt\" <= ?)
+             ORDER BY COALESCE(e.\"UpdatedAt\", 0) ASC, w.\"Id\" ASC
+             LIMIT ?",
         )?;
-        let rows = stmt.query_map(params![limit], |r| {
+        let rows = stmt.query_map(params![now - backoff, limit], |r| {
             Ok((r.get(0)?, r.get(1)?, r.get(2)?))
         })?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// Forget every image-embedding verdict, so the next pass rebuilds the
+    /// image index (used when the embedding space changes).
+    pub fn reset_image_embedding_states(&self) -> Result<(), UkgError> {
+        self.conn.execute("DELETE FROM \"PrecallImageEmbedding\"", [])?;
+        Ok(())
+    }
+
+    /// Re-queue every capture for the text leg (used when the text embedding
+    /// space changes).
+    pub fn mark_all_unprocessed(&self) -> Result<(), UkgError> {
+        self.conn
+            .execute("UPDATE \"WindowCapture\" SET \"IsProcessed\" = 0", [])?;
+        Ok(())
     }
 
     /// Delete every trace of a client (panic button).

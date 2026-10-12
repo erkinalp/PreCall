@@ -106,7 +106,19 @@ captures processed by an older, text-only build are **backfilled** from the
 stored screenshots, and a capture whose embedding failed while the AI service
 was down is **retried** rather than lost. Per-capture state lives in
 `PrecallImageEmbedding` (`pending`/`done`/`skipped`); `skipped` records why
-(no timestamp, non-JPEG frame, refused input) and is never retried.
+(no timestamp, non-JPEG frame, refused input) and is never retried. Retries
+back off for a minute and the queue is ordered least-recently-attempted first,
+so a handful of stuck captures cannot starve the rest of the backlog.
+
+Embeddings carry the **vector space** that produced them (`space` on every
+`/embed/*` response, `*_space_id` on `/health`), and that id is stamped into
+each `si_*` store. Vectors from different encoders are incomparable even at the
+same dimension, so when the space changes — enabling the AI service after
+running with the built-in hash embedder, or switching models — the enricher
+clears the affected store and rebuilds it, and a query that arrives before the
+rebuild reports the mismatch in `notes` instead of ranking incomparable
+vectors. (The Rust and Python hash fallbacks are different functions and carry
+different ids.)
 
 ## Repo layout
 

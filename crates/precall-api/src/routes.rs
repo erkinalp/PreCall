@@ -143,24 +143,46 @@ fn decode_image_query(s: &str) -> Result<Vec<u8>, ApiError> {
 /// BM25 magnitude collapses to ~1e-6.
 const RRF_K: f64 = 60.0;
 
+/// Whether a store's vectors were produced by the embedder now being queried.
+enum SpaceVerdict {
+    Ok,
+    /// The store was built in a different space (previous label carried).
+    Mismatch(String),
+}
+
+/// Compare the store's stamped space against the query embedding's space.
+///
+/// Same dimension is not enough: a hash embedding and a CLIP embedding are
+/// incomparable, so a store built before the AI service was configured must be
+/// reported, not silently ranked against CLIP queries.
+fn index_space_verdict(
+    idx: &SemanticIndex,
+    query_space: &str,
+) -> Result<SpaceVerdict, ApiError> {
+    match idx.space_id()? {
+        Some(stored)
+            if stored != query_space && stored != precall_store::SPACE_UNKNOWN =>
+        {
+            Ok(SpaceVerdict::Mismatch(stored))
+        }
+        _ => Ok(SpaceVerdict::Ok),
+    }
+}
+
 /// A semantic candidate with no positive similarity is not evidence of
 /// similarity: the flat cosine scan returns *every* stored item, so the
 /// zero/negative tail is the whole store, not a match.
 const MIN_SEMANTIC_SCORE: f32 = 0.0;
 
-/// Resolve ranked semantic hits into ranked capture ids plus their metadata,
-/// dropping non-evidence (score ≤ 0) and anything the caller's time/app filters
-/// exclude.
+/// Resolve a semantic leg's hits into ranked capture ids plus their metadata.
 ///
-/// The filters must be applied here and not only in the FTS SQL: in
-/// `mode=image` there is no FTS leg at all, so an unfiltered semantic merge
-/// happily returns captures outside the requested window or application.
+/// The candidate list is already filtered (the scan takes an allow-list), so
+/// this only drops non-evidence: the flat cosine scan returns *every* stored
+/// item, and a zero/negative similarity is the absence of a match rather than a
+/// weak one.
 fn semantic_candidates(
     db: &Ukg,
     semantic: &[precall_store::EmbeddingHit],
-    start: Option<i64>,
-    end: Option<i64>,
-    app_filter: &[String],
 ) -> Result<(Vec<i64>, HashMap<i64, precall_store::SearchHit>), ApiError> {
     let mut ids: Vec<i64> = Vec::new();
     for h in semantic {
@@ -174,22 +196,29 @@ fn semantic_candidates(
         }
     }
     let meta = db.captures_by_ids(&ids)?;
-    let mut ordered: Vec<i64> = Vec::new();
-    for id in ids {
-        let Some(h) = meta.get(&id) else { continue };
-        if start.is_some_and(|s| h.timestamp_100ns < s) {
-            continue;
+    Ok((ids, meta))
+}
+
+/// Merge a semantic leg's survivors into the result set and record the leg.
+fn absorb_semantic_leg(
+    hits: &mut HashMap<i64, precall_store::SearchHit>,
+    leg_ranks: &mut Vec<Vec<i64>>,
+    legs: &mut Vec<&'static str>,
+    leg: &'static str,
+    db: &Ukg,
+    found: &[precall_store::EmbeddingHit],
+) -> Result<(), ApiError> {
+    let (ids, meta) = semantic_candidates(db, found)?;
+    // Only survivors may enter the result set: a candidate the filters
+    // excluded must not come back with a zero score.
+    for id in &ids {
+        if let Some(h) = meta.get(id) {
+            hits.entry(*id).or_insert_with(|| h.clone());
         }
-        if end.is_some_and(|e| h.timestamp_100ns > e) {
-            continue;
-        }
-        ordered.push(id);
     }
-    if !app_filter.is_empty() {
-        let allowed = db.ids_matching_app_filter(&ordered, app_filter)?;
-        ordered.retain(|id| allowed.contains(id));
-    }
-    Ok((ordered, meta))
+    leg_ranks.push(ids);
+    legs.push(leg);
+    Ok(())
 }
 
 /// Reciprocal rank fusion over one id list per leg that ran.
@@ -278,24 +307,26 @@ async fn search(
     // Text query → text space.
     if (mode == "hybrid" || mode == "semantic") && has_query {
         match st.embedder.embed_text(&body.query).await {
-            EmbedOutcome::Ok(qemb) => {
+            EmbedOutcome::Ok { embedding: qemb, space } => {
                 let idx = SemanticIndex::open(
                     &dir.join("SemanticTextStore.db"),
                     st.embedding_dim,
-                    "text",
+                    precall_store::SPACE_UNKNOWN,
                 )?;
-                let found = idx.search(&qemb, (limit * 2) as usize)?;
-                let (ids, meta) =
-                    semantic_candidates(&db, &found, start, end, &body.app_filter)?;
-                // Only survivors may enter the result set: a candidate the
-                // filters excluded must not come back with a zero score.
-                for id in &ids {
-                    if let Some(h) = meta.get(id) {
-                        hits.entry(*id).or_insert_with(|| h.clone());
+                match index_space_verdict(&idx, &space)? {
+                    SpaceVerdict::Ok => {
+                        let allowed = db.capture_ids_matching_filters(start, end, &body.app_filter)?;
+                        let found =
+                            idx.search(&qemb, (limit * 2) as usize, allowed.as_ref())?;
+                        absorb_semantic_leg(
+                            &mut hits, &mut leg_ranks, &mut legs, "text-semantic", &db, &found,
+                        )?;
                     }
+                    SpaceVerdict::Mismatch(stored) => notes.push(format!(
+                        "text-semantic leg skipped: SemanticTextStore.db was built with {stored}, \
+                         not {space}; the enricher will rebuild it"
+                    )),
                 }
-                leg_ranks.push(ids);
-                legs.push("text-semantic");
             }
             EmbedOutcome::Disabled => {
                 notes.push("text-semantic leg skipped: no embedder configured".into())
@@ -313,24 +344,26 @@ async fn search(
             return Err(ApiError::BadRequest("image query is empty".into()));
         }
         match st.embedder.embed_image(&raw).await {
-            EmbedOutcome::Ok(emb) => {
+            EmbedOutcome::Ok { embedding: emb, space } => {
                 let idx = SemanticIndex::open(
                     &dir.join("SemanticImageStore.db"),
                     st.embedding_dim,
-                    "image",
+                    precall_store::SPACE_UNKNOWN,
                 )?;
-                let found = idx.search(&emb, (limit * 2) as usize)?;
-                let (ids, meta) =
-                    semantic_candidates(&db, &found, start, end, &body.app_filter)?;
-                // Only survivors may enter the result set: a candidate the
-                // filters excluded must not come back with a zero score.
-                for id in &ids {
-                    if let Some(h) = meta.get(id) {
-                        hits.entry(*id).or_insert_with(|| h.clone());
+                match index_space_verdict(&idx, &space)? {
+                    SpaceVerdict::Ok => {
+                        let allowed = db.capture_ids_matching_filters(start, end, &body.app_filter)?;
+                        let found =
+                            idx.search(&emb, (limit * 2) as usize, allowed.as_ref())?;
+                        absorb_semantic_leg(
+                            &mut hits, &mut leg_ranks, &mut legs, "image-semantic", &db, &found,
+                        )?;
                     }
+                    SpaceVerdict::Mismatch(stored) => notes.push(format!(
+                        "image-semantic leg skipped: SemanticImageStore.db was built with {stored}, \
+                         not {space}; the enricher will rebuild it"
+                    )),
                 }
-                leg_ranks.push(ids);
-                legs.push("image-semantic");
             }
             EmbedOutcome::Disabled => {
                 return Err(ApiError::BadRequest(
@@ -356,24 +389,26 @@ async fn search(
     // "no matches".
     if (mode == "hybrid" || mode == "semantic") && has_query {
         match st.embedder.embed_image_text(&body.query).await {
-            EmbedOutcome::Ok(emb) => {
+            EmbedOutcome::Ok { embedding: emb, space } => {
                 let idx = SemanticIndex::open(
                     &dir.join("SemanticImageStore.db"),
                     st.embedding_dim,
-                    "image",
+                    precall_store::SPACE_UNKNOWN,
                 )?;
-                let found = idx.search(&emb, (limit * 2) as usize)?;
-                let (ids, meta) =
-                    semantic_candidates(&db, &found, start, end, &body.app_filter)?;
-                // Only survivors may enter the result set: a candidate the
-                // filters excluded must not come back with a zero score.
-                for id in &ids {
-                    if let Some(h) = meta.get(id) {
-                        hits.entry(*id).or_insert_with(|| h.clone());
+                match index_space_verdict(&idx, &space)? {
+                    SpaceVerdict::Ok => {
+                        let allowed = db.capture_ids_matching_filters(start, end, &body.app_filter)?;
+                        let found =
+                            idx.search(&emb, (limit * 2) as usize, allowed.as_ref())?;
+                        absorb_semantic_leg(
+                            &mut hits, &mut leg_ranks, &mut legs, "image-text", &db, &found,
+                        )?;
                     }
+                    SpaceVerdict::Mismatch(stored) => notes.push(format!(
+                        "text→image leg skipped: SemanticImageStore.db was built with {stored}, \
+                         not {space}; the enricher will rebuild it"
+                    )),
                 }
-                leg_ranks.push(ids);
-                legs.push("image-text");
             }
             EmbedOutcome::Disabled => notes.push(
                 "text→image leg skipped: needs a CLIP-backed AI service (/embed/image-text)".into(),

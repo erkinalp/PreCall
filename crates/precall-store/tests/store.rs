@@ -133,9 +133,15 @@ fn semantic_index_round_trip() {
     let item_b = SemanticIndex::item_id_for_capture(43);
     idx.insert(&item_a, Some("r1"), None, &[1.0, 0.0, 0.0, 0.0]).unwrap();
     idx.insert(&item_b, Some("r2"), None, &[0.0, 1.0, 0.0, 0.0]).unwrap();
-    let hits = idx.search(&[0.9, 0.1, 0.0, 0.0], 1).unwrap();
+    let hits = idx.search(&[0.9, 0.1, 0.0, 0.0], 1, None).unwrap();
     assert_eq!(hits.len(), 1);
     assert_eq!(SemanticIndex::capture_id_for_item(&hits[0].item_id), Some(42));
+    // An allow-list is applied during the scan, not to a truncated top-k: a
+    // rank-2 match survives when only it is allowed.
+    let only_b = std::collections::HashSet::from([43]);
+    let filtered = idx.search(&[0.9, 0.1, 0.0, 0.0], 1, Some(&only_b)).unwrap();
+    assert_eq!(filtered.len(), 1);
+    assert_eq!(SemanticIndex::capture_id_for_item(&filtered[0].item_id), Some(43));
 }
 
 #[test]
@@ -178,4 +184,96 @@ fn envelope_cipher_tamper_detection() {
     let n = sealed.len();
     sealed[n - 1] ^= 1;
     assert!(c.open(b"t", &sealed).is_err());
+}
+
+#[test]
+fn a_torn_insert_is_not_treated_as_done() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("SemanticImageStore.db");
+    let idx = SemanticIndex::open(&path, 4, "hash:test@4").unwrap();
+    let item = SemanticIndex::item_id_for_capture(9);
+    // Simulate a crash after the first of the three inserts.
+    {
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute(
+            "INSERT INTO \"si_items\" (\"id\") VALUES (?)",
+            rusqlite::params![item.clone()],
+        )
+        .unwrap();
+    }
+    assert!(
+        !idx.has_item(&item).unwrap(),
+        "an item row without a graph row is not a searchable embedding"
+    );
+    // The repair path can then complete the insert.
+    idx.insert(&item, None, None, &[1.0, 0.0, 0.0, 0.0]).unwrap();
+    assert!(idx.has_item(&item).unwrap());
+}
+
+#[test]
+fn space_id_round_trips_and_clear_empties_the_store() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("SemanticTextStore.db");
+    let idx = SemanticIndex::open(&path, 4, "hash:first@4").unwrap();
+    assert_eq!(idx.space_id().unwrap().as_deref(), Some("hash:first@4"));
+    idx.insert(
+        &SemanticIndex::item_id_for_capture(1),
+        None,
+        None,
+        &[1.0, 0.0, 0.0, 0.0],
+    )
+    .unwrap();
+    idx.set_space_id("clip:second@4").unwrap();
+    assert_eq!(idx.space_id().unwrap().as_deref(), Some("clip:second@4"));
+    idx.clear().unwrap();
+    assert_eq!(idx.count().unwrap(), 0);
+    assert!(!idx.has_item(&SemanticIndex::item_id_for_capture(1)).unwrap());
+}
+
+/// The retry queue must not let a batch of stuck captures monopolize it: rows
+/// attempted recently are skipped, never-attempted rows come first, and the
+/// rest rotate by how long ago they were tried.
+#[test]
+fn image_backfill_queue_rotates_and_backs_off() {
+    let db = Ukg::open_in_memory().unwrap();
+    let mut ids = Vec::new();
+    for n in 1..=3u64 {
+        let mut rec = sample_capture(n);
+        rec.image_token = format!("tok-{n}");
+        let id = db.insert_capture(&rec).unwrap();
+        db.mark_processed(id).unwrap();
+        ids.push(id);
+    }
+    let now = 133_000_000_000_000_000i64;
+    let backoff = 60 * 10_000_000i64;
+
+    // #1 failed just now; #3 failed long ago; #2 has never been attempted.
+    db.set_image_embedding_state(ids[0], "pending", 1, Some("stub"), now)
+        .unwrap();
+    db.set_image_embedding_state(ids[2], "pending", 1, Some("stub"), now - 3 * backoff)
+        .unwrap();
+    // A settled capture is never selected.
+    db.set_image_embedding_state(ids[1], "skipped", 1, Some("non-JPEG frame"), now)
+        .unwrap();
+
+    // #1 is inside its backoff window: the other two still get served.
+    let queued: Vec<i64> = db
+        .captures_needing_image_embedding(64, now, backoff)
+        .unwrap()
+        .into_iter()
+        .map(|(id, _, _)| id)
+        .collect();
+    assert_eq!(queued, vec![ids[2]], "only the elapsed retry is due: {queued:?}");
+
+    // Once its backoff elapses, #1 returns — it is not starved forever.
+    let later = now + backoff + 1;
+    let queued: Vec<i64> = db
+        .captures_needing_image_embedding(64, later, backoff)
+        .unwrap()
+        .into_iter()
+        .map(|(id, _, _)| id)
+        .collect();
+    // #3 was attempted longest ago, so it comes first; #1's slot is now due
+    // rather than excluded.
+    assert_eq!(queued, vec![ids[2], ids[0]], "oldest attempt first: {queued:?}");
 }

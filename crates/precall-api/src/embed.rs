@@ -13,6 +13,14 @@ use sha2::{Digest, Sha256};
 
 pub const EMBED_DIM: usize = 384;
 
+/// Identity of the deterministic in-process embedder's vector spaces.
+///
+/// The Python fallback hashes differently (XOR vs. sum of digests), so its
+/// space id differs — switching between the two *must* invalidate the stores
+/// instead of silently comparing incomparable vectors.
+pub const LOCAL_TEXT_SPACE: &str = "hash:rust-text@384";
+pub const LOCAL_IMAGE_SPACE: &str = "hash:rust-image@384";
+
 /// Why an embedding call ended the way it did.
 ///
 /// `Option<Vec<f32>>` cannot express this, and the enrichment loop needs the
@@ -21,14 +29,26 @@ pub const EMBED_DIM: usize = 384;
 /// succeed and must stop consuming attempts.
 #[derive(Debug, Clone, PartialEq)]
 pub enum EmbedOutcome {
-    /// The vector.
-    Ok(Vec<f32>),
+    /// The vector, plus the space it belongs to. Vectors from different models
+    /// are incomparable even at equal dimension, so the space travels with the
+    /// value rather than being assumed.
+    Ok { embedding: Vec<f32>, space: String },
     /// No embedder is configured — nothing to retry.
     Disabled,
     /// Upstream refused this input (4xx, e.g. an undecodable frame).
     Rejected,
     /// Transport error, timeout or 5xx — retry later.
     Retry,
+}
+
+impl EmbedOutcome {
+    /// The embedding, if this call produced one.
+    pub fn embedding(self) -> Option<Vec<f32>> {
+        match self {
+            EmbedOutcome::Ok { embedding, .. } => Some(embedding),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -53,6 +73,36 @@ impl Embedder {
         }
     }
 
+    /// Which text/image vector spaces this embedder produces right now.
+    ///
+    /// For the in-process embedder these are constants. For the AI service the
+    /// spaces are whatever *it* reports at `/health`, because the same URL can
+    /// be backed by a hash fallback today and CLIP tomorrow: `None` means the
+    /// service did not answer, so the caller must not conclude that anything
+    /// changed.
+    pub async fn spaces(&self) -> Option<(String, String)> {
+        match self {
+            Embedder::Local => Some((LOCAL_TEXT_SPACE.to_string(), LOCAL_IMAGE_SPACE.to_string())),
+            Embedder::Disabled => None,
+            Embedder::Http { base, client } => {
+                #[derive(serde::Deserialize)]
+                struct Health {
+                    text_space_id: Option<String>,
+                    image_space_id: Option<String>,
+                }
+                let r = client.get(format!("{base}/health")).send().await.ok()?;
+                if !r.status().is_success() {
+                    return None;
+                }
+                let h: Health = r.json().await.ok()?;
+                match (h.text_space_id, h.image_space_id) {
+                    (Some(t), Some(i)) => Some((t, i)),
+                    _ => None,
+                }
+            }
+        }
+    }
+
     /// Embed text → `dim` f32s. `Disabled` when no embedder is configured.
     pub async fn embed_text(&self, text: &str) -> EmbedOutcome {
         match self {
@@ -64,6 +114,8 @@ impl Embedder {
                 #[derive(serde::Deserialize)]
                 struct Resp {
                     embedding: Vec<f32>,
+                    #[serde(default)]
+                    space: Option<String>,
                 }
                 let r = match client
                     .post(format!("{base}/embed/text"))
@@ -85,14 +137,20 @@ impl Embedder {
                     return EmbedOutcome::Retry;
                 }
                 match r.json::<Resp>().await {
-                    Ok(x) => EmbedOutcome::Ok(x.embedding),
+                    Ok(x) => EmbedOutcome::Ok {
+                        embedding: x.embedding,
+                        space: x.space.unwrap_or_else(|| format!("http:{base}")),
+                    },
                     Err(e) => {
                         tracing::debug!("text embed response unreadable: {e}");
                         EmbedOutcome::Retry
                     }
                 }
             }
-            Embedder::Local => EmbedOutcome::Ok(hash_embedding(text, EMBED_DIM)),
+            Embedder::Local => EmbedOutcome::Ok {
+                embedding: hash_embedding(text, EMBED_DIM),
+                space: LOCAL_TEXT_SPACE.to_string(),
+            },
             Embedder::Disabled => EmbedOutcome::Disabled,
         }
     }
@@ -108,6 +166,8 @@ impl Embedder {
                 #[derive(serde::Deserialize)]
                 struct Resp {
                     embedding: Vec<f32>,
+                    #[serde(default)]
+                    space: Option<String>,
                 }
                 let r = match client
                     .post(format!("{base}/embed/image"))
@@ -135,7 +195,10 @@ impl Embedder {
                     return EmbedOutcome::Retry;
                 }
                 match r.json::<Resp>().await {
-                    Ok(x) => EmbedOutcome::Ok(x.embedding),
+                    Ok(x) => EmbedOutcome::Ok {
+                        embedding: x.embedding,
+                        space: x.space.unwrap_or_else(|| format!("http:{base}")),
+                    },
                     Err(e) => {
                         tracing::debug!("image embed response unreadable: {e}");
                         EmbedOutcome::Retry
@@ -161,7 +224,10 @@ impl Embedder {
                 for x in v.iter_mut() {
                     *x /= n;
                 }
-                EmbedOutcome::Ok(v)
+                EmbedOutcome::Ok {
+                    embedding: v,
+                    space: LOCAL_IMAGE_SPACE.to_string(),
+                }
             }
             Embedder::Disabled => EmbedOutcome::Disabled,
         }
@@ -188,6 +254,8 @@ impl Embedder {
         #[derive(serde::Deserialize)]
         struct Resp {
             embedding: Vec<f32>,
+            #[serde(default)]
+            space: Option<String>,
         }
         let r = match client
             .post(format!("{base}/embed/image-text"))
@@ -214,7 +282,10 @@ impl Embedder {
             return EmbedOutcome::Retry;
         }
         match r.json::<Resp>().await {
-            Ok(x) => EmbedOutcome::Ok(x.embedding),
+            Ok(x) => EmbedOutcome::Ok {
+                embedding: x.embedding,
+                space: x.space.unwrap_or_else(|| format!("http:{base}")),
+            },
             Err(e) => {
                 tracing::debug!("image-text embed response unreadable: {e}");
                 EmbedOutcome::Retry
@@ -281,10 +352,10 @@ mod tests {
     #[tokio::test]
     async fn local_embedding_is_deterministic_and_normalized() {
         let e = Embedder::Local;
-        let EmbedOutcome::Ok(a) = e.embed_text("kerberos tickets").await else {
+        let EmbedOutcome::Ok { embedding: a, .. } = e.embed_text("kerberos tickets").await else {
             panic!("local embedder must succeed");
         };
-        let EmbedOutcome::Ok(b) = e.embed_text("kerberos tickets").await else {
+        let EmbedOutcome::Ok { embedding: b, .. } = e.embed_text("kerberos tickets").await else {
             panic!("local embedder must succeed");
         };
         assert_eq!(a, b);
@@ -298,10 +369,10 @@ mod tests {
     #[tokio::test]
     async fn local_image_embedding_fits_the_store() {
         let e = Embedder::Local;
-        let EmbedOutcome::Ok(a) = e.embed_image(b"\xff\xd8scene-a\xff\xd9").await else {
+        let EmbedOutcome::Ok { embedding: a, .. } = e.embed_image(b"\xff\xd8scene-a\xff\xd9").await else {
             panic!("local embedder must succeed");
         };
-        let EmbedOutcome::Ok(b) = e.embed_image(b"\xff\xd8scene-b\xff\xd9").await else {
+        let EmbedOutcome::Ok { embedding: b, .. } = e.embed_image(b"\xff\xd8scene-b\xff\xd9").await else {
             panic!("local embedder must succeed");
         };
         assert_eq!(a.len(), EMBED_DIM);

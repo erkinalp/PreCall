@@ -106,6 +106,10 @@ pub async fn enrich_once(
 ) -> anyhow::Result<EnrichStats> {
     let mut stats = EnrichStats::default();
 
+    // Asked once per pass, not once per client: this is an HTTP round-trip for
+    // the AI-backed embedder, and every client shares the answer.
+    let spaces = embedder.spaces().await;
+
     let mut dirs = Vec::new();
     let mut rd = std::fs::read_dir(data_root)?;
     while let Some(ent) = rd.next().transpose()? {
@@ -124,10 +128,51 @@ pub async fn enrich_once(
             .to_string();
 
         let ukg = Ukg::open(&dir.join("ukg.db"))?;
+        let text_index = SemanticIndex::open(
+            &dir.join("SemanticTextStore.db"),
+            dim,
+            precall_store::SPACE_UNKNOWN,
+        )?;
+        let image_index = SemanticIndex::open(
+            &dir.join("SemanticImageStore.db"),
+            dim,
+            precall_store::SPACE_UNKNOWN,
+        )?;
+        let objects = ObjectStore::encrypted(dir.join("objects"), object_key)?;
+        let now = precall_proto::time::filetime_now() as i64;
+
+        // A vector store is only meaningful against the embedder that filled
+        // it. Enabling the AI service (or switching models) after a run with
+        // the hash embedder leaves rows that are incomparable with the new
+        // queries, so the affected store is rebuilt instead of being ranked
+        // against them. `spaces()` answers `None` when the service cannot say,
+        // and then nothing is invalidated.
+        if let Some((text_space, image_space)) = spaces.as_ref() {
+            if let Some(stored) = text_index.space_id()? {
+                if stored != *text_space && stored != precall_store::SPACE_UNKNOWN {
+                    warn!(client, stored, active = %text_space,
+                          "text embedding space changed; rebuilding SemanticTextStore");
+                    text_index.clear()?;
+                    ukg.mark_all_unprocessed()?;
+                }
+            }
+            text_index.set_space_id(text_space)?;
+
+            if let Some(stored) = image_index.space_id()? {
+                if stored != *image_space && stored != precall_store::SPACE_UNKNOWN {
+                    warn!(client, stored, active = %image_space,
+                          "image embedding space changed; rebuilding SemanticImageStore");
+                    image_index.clear()?;
+                    ukg.reset_image_embedding_states()?;
+                }
+            }
+            image_index.set_space_id(image_space)?;
+        }
 
         // Queue 1: already-processed captures with no image embedding (or a
-        // pending one). Empty on a fresh install's first pass.
-        let backfill = ukg.captures_needing_image_embedding(BATCH)?;
+        // pending one whose backoff has elapsed). Empty on a fresh install's
+        // first pass.
+        let backfill = ukg.captures_needing_image_embedding(BATCH, now, RETRY_BACKOFF_TICKS)?;
 
         // Queue 2: fresh captures — both legs inline.
         let fresh: Vec<(i64, Option<i64>, Option<String>)> = {
@@ -143,10 +188,6 @@ pub async fn enrich_once(
         if backfill.is_empty() && fresh.is_empty() {
             continue;
         }
-
-        let text_index = SemanticIndex::open(&dir.join("SemanticTextStore.db"), dim, "text")?;
-        let image_index = SemanticIndex::open(&dir.join("SemanticImageStore.db"), dim, "image")?;
-        let objects = ObjectStore::encrypted(dir.join("objects"), object_key)?;
 
         // --- Queue 1: backfill / retry (image leg only) ---------------------
         //
@@ -191,8 +232,9 @@ pub async fn enrich_once(
             let mut text_retry = false;
             if !text.is_empty() && !text_index.has_item(&item)? {
                 match embedder.embed_text(&text).await {
-                    EmbedOutcome::Ok(emb) => {
+                    EmbedOutcome::Ok { embedding: emb, space } => {
                         text_index.insert(&item, None, None, &emb)?;
+                        text_index.set_space_id(&space)?;
                         stats.text_embeddings += 1;
                     }
                     EmbedOutcome::Disabled => {}
@@ -346,9 +388,10 @@ fn image_record(
 ) -> anyhow::Result<ImageLeg> {
     let now = precall_proto::time::filetime_now() as i64;
     match outcome {
-        EmbedOutcome::Ok(emb) => {
+        EmbedOutcome::Ok { embedding, space } => {
             let item = SemanticIndex::item_id_for_capture(wc_id);
-            image_index.insert(&item, None, None, &emb)?;
+            image_index.insert(&item, None, None, &embedding)?;
+            image_index.set_space_id(&space)?;
             ukg.set_image_embedding_state(wc_id, "done", attempts + 1, None, now)?;
             stats.image_embeddings += 1;
             Ok(ImageLeg::Done)
@@ -385,3 +428,8 @@ fn image_record(
 
 /// Captures handled per queue per pass.
 const BATCH: i64 = 64;
+
+/// How long a failed image attempt waits before it is retried. Without this a
+/// batch of stuck captures is re-attempted every poll interval and, because the
+/// queue is `LIMIT`ed, starves every later capture.
+const RETRY_BACKOFF_TICKS: i64 = 60 * 10_000_000; // 60s

@@ -164,3 +164,26 @@ def test_rocm_maps_onto_the_cuda_device_api() -> None:
     assert ImageEmbedder(device="rocm").device == "cuda"
     ite = ImageTextEmbedder.from_encoder(ImageEmbedder(device="rocm"))
     assert ite.device == "cuda"
+
+
+def test_every_embedding_reports_its_vector_space(client: TestClient) -> None:
+    """Vectors from different encoders are incomparable, so the space travels
+    with the embedding and is stamped into the si_* stores."""
+    health = client.get("/health").json()
+    assert health["text_space_id"]
+    assert health["image_space_id"]
+    assert health["image_space_id"] != health["text_space_id"]
+
+    t = client.post("/embed/text", json={"text": "kerberos"}).json()
+    assert t["space"] == health["text_space_id"]
+    i = client.post(
+        "/embed/image", content=b"\xff\xd8\xff\xd9", headers={"content-type": "image/jpeg"}
+    ).json()
+    assert i["space"] == health["image_space_id"]
+
+
+def test_image_text_encoder_shares_the_image_space_id() -> None:
+    """This is what makes text→image search meaningful: one space, or none."""
+    enc = ImageEmbedder()
+    ite = ImageTextEmbedder.from_encoder(enc)
+    assert ite.space_id == enc.space_id

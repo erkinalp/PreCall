@@ -72,6 +72,8 @@ def health() -> dict:
         "text_backend": app.state.text_embedder.backend,
         "image_backend": app.state.image_embedder.backend,
         "image_text_backend": app.state.image_text_embedder.backend,
+        "text_space_id": app.state.text_embedder.space_id,
+        "image_space_id": app.state.image_embedder.space_id,
         "dim": DIM,
         "device": app.state.text_embedder.device,
     }
@@ -79,8 +81,9 @@ def health() -> dict:
 
 @app.post("/embed/text")
 def embed_text(req: EmbedTextReq) -> dict:
-    emb = _text_embedder().embed([req.text])[0]
-    return {"embedding": emb.tolist(), "dim": int(emb.shape[0])}
+    enc = _text_embedder()
+    emb = enc.embed([req.text])[0]
+    return {"embedding": emb.tolist(), "dim": int(emb.shape[0]), "space": enc.space_id}
 
 
 @app.post("/embed/text/batch")
@@ -95,7 +98,11 @@ async def embed_image(request: Request) -> dict:
     if not body:
         return {"embedding": [], "dim": DIM}
     emb = app.state.image_embedder.embed(body)
-    return {"embedding": emb.tolist(), "dim": int(emb.shape[0])}
+    return {
+        "embedding": emb.tolist(),
+        "dim": int(emb.shape[0]),
+        "space": app.state.image_embedder.space_id,
+    }
 
 
 @app.post("/embed/image-text")
@@ -114,7 +121,11 @@ def embed_image_text(req: EmbedTextReq) -> dict:
             status_code=501,
             content={"error": str(e), "image_text_backend": "hash"},
         )
-    return {"embedding": emb.tolist(), "dim": int(emb.shape[0])}
+    return {
+        "embedding": emb.tolist(),
+        "dim": int(emb.shape[0]),
+        "space": app.state.image_text_embedder.space_id,
+    }
 
 
 @app.post("/topics")

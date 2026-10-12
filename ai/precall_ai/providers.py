@@ -59,6 +59,22 @@ class TextEmbedder:
             self._model = None
             self.backend = "hash"
 
+    @property
+    def space_id(self) -> str:
+        """Identity of the vector space this encoder produces.
+
+        Vectors from different encoders are incomparable even at the same
+        dimension, so this travels with every embedding and is stamped into the
+        `si_*` stores: a deployment switching encoder must rebuild, not mix.
+        Note the Python hash and the Rust local hash are *different* functions,
+        hence different ids.
+        """
+        return (
+            f"st:{_MODEL_NAME}@{DIM}"
+            if self.backend == "sentence-transformers"
+            else f"hash:python-text@{DIM}"
+        )
+
     def embed(self, texts: list[str]) -> np.ndarray:
         if self._model is not None:
             emb = self._model.encode(
@@ -99,6 +115,14 @@ class ImageEmbedder:
         else:
             self._model, self._preprocess, self.device = loaded
             self.backend = "clip"
+
+    @property
+    def space_id(self) -> str:
+        return (
+            f"clip:{CLIP_MODEL_NAME}@{DIM}"
+            if self.backend == "clip"
+            else f"hash:python-image@{DIM}"
+        )
 
     def embed(self, jpeg: bytes) -> np.ndarray:
         if self._model is not None and self._preprocess is not None:
@@ -197,6 +221,21 @@ class ImageTextEmbedder:
     @property
     def backend(self) -> str:
         return "clip" if self.available else "hash"
+
+    @property
+    def space_id(self) -> str:
+        """The *image* space — text queries must land where the screenshots are.
+
+        Always reported as the image encoder's space (never a space of its own),
+        so the two cannot drift: if these ever differed, text→image search would
+        be comparing incomparable vectors. Without CLIP the encoder cannot
+        answer at all (the route returns 501), so the value is inert.
+        """
+        return (
+            f"clip:{CLIP_MODEL_NAME}@{DIM}"
+            if self.available
+            else f"hash:python-image@{DIM}"
+        )
 
     def embed(self, text: str) -> np.ndarray:
         if not self.available:

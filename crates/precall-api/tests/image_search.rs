@@ -127,13 +127,19 @@ fn seed() -> Fixture {
     Fixture { _dir: dir, data_root, client, key, id_a, id_b }
 }
 
-fn image_index(fx: &Fixture) -> SemanticIndex {
+/// The image store, stamped with the space of the embedder the test will query
+/// with — a store built by one model cannot be ranked against another's query.
+fn image_index_in_space(fx: &Fixture, space: &str) -> SemanticIndex {
     SemanticIndex::open(
         &fx.data_root.join(&fx.client).join("SemanticImageStore.db"),
         384,
-        "image",
+        space,
     )
     .unwrap()
+}
+
+fn image_index(fx: &Fixture) -> SemanticIndex {
+    image_index_in_space(fx, precall_api::LOCAL_IMAGE_SPACE)
 }
 
 async fn serve(fx: &Fixture, embedder: Embedder) -> SocketAddr {
@@ -282,13 +288,22 @@ async fn text_to_image_leg_is_reported_skipped_without_clip() {
     );
 }
 
+/// Space id the CLIP-shaped stubs advertise (and the tests stamp their stores
+/// with) — deliberately not the local hash space, so a test that forgot to
+/// align them fails loudly instead of passing by accident.
+const STUB_CLIP_SPACE: &str = "clip:stub-vit@384";
+
 #[derive(Clone)]
 struct StubAi {
     image_text: Arc<Vec<f32>>,
 }
 
 async fn stub_image_text(State(s): State<StubAi>) -> axum::Json<serde_json::Value> {
-    axum::Json(serde_json::json!({ "embedding": *s.image_text, "dim": s.image_text.len() }))
+    axum::Json(serde_json::json!({
+        "embedding": *s.image_text,
+        "dim": s.image_text.len(),
+        "space": STUB_CLIP_SPACE,
+    }))
 }
 
 #[tokio::test]
@@ -301,7 +316,7 @@ async fn text_query_reaches_the_image_space_when_the_ai_backend_is_clip() {
     let vector: Vec<f32> = (0..384).map(|i| (i as f32 * 0.01).sin()).collect();
     let norm: f32 = vector.iter().map(|x| x * x).sum::<f32>().sqrt();
     let vector: Vec<f32> = vector.into_iter().map(|x| x / norm).collect();
-    let idx = image_index(&fx);
+    let idx = image_index_in_space(&fx, STUB_CLIP_SPACE);
     for id in [fx.id_a, fx.id_b] {
         let mut other = vec![0.0f32; 384];
         other[0] = 1.0;
@@ -594,7 +609,7 @@ async fn image_search_enforces_time_range_and_app_filter() {
 #[tokio::test]
 async fn image_search_drops_non_positive_similarity() {
     let fx = seed();
-    let EmbedOutcome::Ok(emb) = Embedder::Local.embed_image(JPEG_A).await else {
+    let EmbedOutcome::Ok { embedding: emb, .. } = Embedder::Local.embed_image(JPEG_A).await else {
         panic!("local embedder must succeed");
     };
     let inverted: Vec<f32> = emb.iter().map(|x| -x).collect();
@@ -668,7 +683,7 @@ async fn an_exact_lexical_match_wins_a_tie_against_a_vector_hit() {
     let vector: Vec<f32> = (0..384).map(|i| (i as f32 * 0.017).cos()).collect();
     let norm: f32 = vector.iter().map(|x| x * x).sum::<f32>().sqrt();
     let vector: Vec<f32> = vector.into_iter().map(|x| x / norm).collect();
-    let idx = image_index(&fx);
+    let idx = image_index_in_space(&fx, STUB_CLIP_SPACE);
     idx.insert(
         &SemanticIndex::item_id_for_capture(fx.id_b),
         None,
@@ -710,5 +725,179 @@ async fn an_exact_lexical_match_wins_a_tie_against_a_vector_hit() {
     assert_eq!(
         ids[0], fx.id_a,
         "the exact lexical match must win the tie, not the newer vector hit: {body}"
+    );
+}
+
+/// An AI-shaped stub that reports its spaces, so the enrichment pass can
+/// invalidate stores built in a different one.
+#[derive(Clone)]
+struct SpaceStub {
+    space: Arc<String>,
+    image: Arc<Vec<f32>>,
+    text: Arc<Vec<f32>>,
+}
+
+async fn stub_health(State(s): State<SpaceStub>) -> axum::Json<serde_json::Value> {
+    axum::Json(serde_json::json!({
+        "status": "ok",
+        "text_space_id": *s.space,
+        "image_space_id": *s.space,
+        "dim": 384,
+    }))
+}
+
+async fn stub_embed_image(State(s): State<SpaceStub>) -> axum::Json<serde_json::Value> {
+    axum::Json(serde_json::json!({ "embedding": *s.image, "space": *s.space }))
+}
+
+async fn stub_embed_text(State(s): State<SpaceStub>) -> axum::Json<serde_json::Value> {
+    axum::Json(serde_json::json!({ "embedding": *s.text, "space": *s.space }))
+}
+
+async fn serve_ai(space: &str) -> SocketAddr {
+    let vector: Vec<f32> = {
+        let mut v = vec![0.0f32; 384];
+        v[0] = 1.0;
+        v
+    };
+    let app = axum::Router::new()
+        .route("/health", axum::routing::get(stub_health))
+        .route("/embed/image", post(stub_embed_image))
+        .route("/embed/text", post(stub_embed_text))
+        .with_state(SpaceStub {
+            space: Arc::new(space.to_string()),
+            image: Arc::new(vector.clone()),
+            text: Arc::new(vector),
+        });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await });
+    addr
+}
+
+/// Finding (pool truncation): filtering the top `2 * limit` candidates *after*
+/// truncation drops eligible matches that rank below the cut.
+#[tokio::test]
+async fn filters_apply_before_the_candidate_pool_is_truncated() {
+    let fx = seed();
+    // Three stored vectors, ranked against the query (1,0,0…): B(0.98) > C(0.9)
+    // > A(0.2). With limit = 1 the pool is 2, so A is below the cut.
+    let mut v_b = vec![0.0f32; 384];
+    v_b[0] = 0.98;
+    v_b[1] = 0.199;
+    let mut v_c = vec![0.0f32; 384];
+    v_c[0] = 0.9;
+    v_c[2] = 0.436;
+    let mut v_a = vec![0.0f32; 384];
+    v_a[0] = 0.2;
+    v_a[3] = 0.98;
+
+    let ukg = Ukg::open(&fx.data_root.join(&fx.client).join("ukg.db")).unwrap();
+    let id_c = ukg
+        .insert_capture(&capture("scene-c.jpg", "tok-c", TS_B + 1, "third", None))
+        .unwrap();
+    // Stamped with the space the stub reports, so only the pool truncation is
+    // under test here.
+    let idx = image_index_in_space(&fx, "clip:stub-vit@384");
+    idx.insert(&SemanticIndex::item_id_for_capture(fx.id_b), None, None, &v_b).unwrap();
+    idx.insert(&SemanticIndex::item_id_for_capture(id_c), None, None, &v_c).unwrap();
+    idx.insert(&SemanticIndex::item_id_for_capture(fx.id_a), None, None, &v_a).unwrap();
+    drop(idx);
+
+    // Allow only A (via its app), with limit = 1: the pool of 2 holds B and C,
+    // so only a scan-time filter can still see A.
+    let addr = serve(&fx, http_embedder(serve_ai("clip:stub-vit@384").await)).await;
+    let r = reqwest::Client::new()
+        .post(format!("http://{addr}/api/v1/search"))
+        .json(&serde_json::json!({
+            "client": fx.client, "mode": "image", "image": b64(JPEG_A),
+            "limit": 1, "app_filter": ["msedge.exe"],
+        }))
+        .send()
+        .await
+        .unwrap();
+    let body: serde_json::Value = r.json().await.unwrap();
+    assert_eq!(
+        body["results"].as_array().unwrap().len(),
+        1,
+        "the eligible match ranks below the top-2 cut and must still be found: {body}"
+    );
+    assert_eq!(body["results"][0]["window_capture_id"], serde_json::json!(fx.id_a));
+}
+
+/// Finding (space invalidation): a store filled by the hash embedder must not
+/// keep answering once the deployment switches to CLIP.
+#[tokio::test]
+async fn switching_the_vector_backend_rebuilds_the_store() {
+    let fx = seed();
+    // Pass 1 in space "clip:stub-a@384" — note /embed/image returns the same
+    // vector for everything, so which space stamped the rows is what matters.
+    let ai_a = serve_ai("clip:stub-a@384").await;
+    let stats = precall_api::enrich::enrich_once(&fx.data_root, &http_embedder(ai_a), 384, fx.key)
+        .await
+        .unwrap();
+    assert_eq!(stats.image_embeddings, 2, "{stats:?}");
+    assert_eq!(
+        image_index(&fx).space_id().unwrap().as_deref(),
+        Some("clip:stub-a@384")
+    );
+
+    // A row from a hypothetical earlier backend survives until the switch.
+    {
+        let idx = image_index(&fx);
+        idx.insert(&SemanticIndex::item_id_for_capture(999), None, None, &vec![0.0f32; 384])
+            .unwrap();
+        assert_eq!(idx.count().unwrap(), 3);
+    }
+
+    // Pass 2 reports a different backend: the store must be rebuilt, not kept.
+    let ai_b = serve_ai("clip:stub-b@384").await;
+    let stats = precall_api::enrich::enrich_once(&fx.data_root, &http_embedder(ai_b), 384, fx.key)
+        .await
+        .unwrap();
+    assert_eq!(stats.image_embeddings, 2, "the backlog must be re-embedded: {stats:?}");
+    let idx = image_index(&fx);
+    assert_eq!(idx.count().unwrap(), 2, "stale rows from the old space are gone");
+    assert_eq!(
+        idx.space_id().unwrap().as_deref(),
+        Some("clip:stub-b@384")
+    );
+}
+
+/// The same switch seen from a query: until the rebuild happens, the leg is
+/// reported as skipped, never ranked against incomparable vectors.
+#[tokio::test]
+async fn queries_refuse_to_rank_against_a_different_space() {
+    let fx = seed();
+    let idx = image_index_in_space(&fx, "clip:stub-a@384");
+    idx.insert(
+        &SemanticIndex::item_id_for_capture(fx.id_a),
+        None,
+        None,
+        &{
+            let mut v = vec![0.0f32; 384];
+            v[0] = 1.0;
+            v
+        },
+    )
+    .unwrap();
+    drop(idx);
+
+    // The API's embedder now reports a different space.
+    let addr = serve(&fx, http_embedder(serve_ai("clip:stub-b@384").await)).await;
+    let r = reqwest::Client::new()
+        .post(format!("http://{addr}/api/v1/search"))
+        .json(&serde_json::json!({
+            "client": fx.client, "mode": "image", "image": b64(JPEG_A),
+        }))
+        .send()
+        .await
+        .unwrap();
+    let body: serde_json::Value = r.json().await.unwrap();
+    assert!(body["results"].as_array().unwrap().is_empty(), "{body}");
+    let notes = body["notes"].as_array().expect("a skipped leg must be named");
+    assert!(
+        notes.iter().any(|n| n.as_str().unwrap().contains("clip:stub-a@384")),
+        "the note must name the store's space: {notes:?}"
     );
 }

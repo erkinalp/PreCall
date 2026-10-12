@@ -21,7 +21,7 @@ mod embed;
 pub mod enrich;
 mod routes;
 
-pub use embed::{EmbedOutcome, Embedder, EMBED_DIM};
+pub use embed::{EmbedOutcome, Embedder, EMBED_DIM, LOCAL_IMAGE_SPACE, LOCAL_TEXT_SPACE};
 pub use routes::{build_router, ApiState};
 
 use thiserror::Error;
