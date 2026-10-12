@@ -1,34 +1,74 @@
 // SPDX-License-Identifier: GPL-2.0-only
-//! Background enrichment: pull `IsProcessed=0` captures, embed their OCR text
-//! into `SemanticTextStore.db`, embed their stored screenshot into
+//! Background enrichment: pull captures out of the metadata database, embed
+//! their OCR text into `SemanticTextStore.db` and their stored screenshot into
 //! `SemanticImageStore.db`, extract topics (when the AI service is attached),
 //! and mark them processed.
 //!
 //! **Both** `si_*` spaces are populated here. The image space is what makes
-//! "show me the screenshot where X" answerable without OCR text; it is fed
-//! from the JPEG object the broker wrote (`{client}/{y}/{m}/{d}/{token}.jpg`),
-//! read back through the same at-rest cipher the `/snapshot` route uses.
+//! "show me the screenshot where X" answerable without OCR text; it is fed from
+//! the JPEG object the broker wrote (`{client}/{y}/{m}/{d}/{token}.jpg`), read
+//! back through the same at-rest cipher the `/snapshot` route uses.
+//!
+//! ## Two queues, two predicates
+//!
+//! The text leg can key off `WindowCapture.IsProcessed`, but that flag cannot
+//! express the image leg's two awkward cases, so image state lives in
+//! `PrecallImageEmbedding` (`pending` | `done` | `skipped`) and the pass runs:
+//!
+//! 1. **backfill / retry** — captures already processed (or already attempted)
+//!    whose image embedding is missing or `pending`. This is what gives an
+//!    upgraded installation its historical screenshots back, and what retries
+//!    a capture after an AI-service outage.
+//! 2. **fresh** — `IsProcessed = 0`, text + image legs inline.
+//!
+//! A transient failure (transport error, timeout, 5xx) leaves the capture
+//! retryable: the image state stays `pending` and a failed text leg leaves
+//! `IsProcessed = 0`. A *refused* input (4xx — an undecodable frame) is
+//! terminal: `skipped`, with the error recorded, because retrying identical
+//! bytes can never succeed.
 //!
 //! Runs in the API process so the broker stays a lean ingester. Polls each
 //! client's store on a cadence — cheap for workstation-scale data.
 
-use crate::embed::Embedder;
+use crate::embed::{EmbedOutcome, Embedder};
 use precall_store::objects::{ymd_from_filetime, ObjectStore};
 use precall_store::{SemanticIndex, Ukg};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tracing::{debug, warn};
 
-/// What one enrichment pass accomplished. Tests assert on it; the polling
-/// loop logs it.
+/// What one enrichment pass accomplished. Tests assert on it; the polling loop
+/// logs it.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct EnrichStats {
     pub text_embeddings: usize,
     pub image_embeddings: usize,
-    /// Captures that could not be image-embedded: no image token, no
-    /// timestamp, or no JPEG object on disk (e.g. the frame arrived with a
-    /// non-JPEG codec).
+    /// Images embedded for captures that were already processed — the
+    /// backfill path (upgraded installs, recovered outages).
+    pub backfilled: usize,
+    /// Captures whose image embedding is terminally unavailable: no image
+    /// token, no timestamp, a non-JPEG frame, or an input the embedder
+    /// refused.
     pub images_skipped: usize,
+    /// Captures whose image embedding failed transiently and will be retried.
+    pub images_pending: usize,
+    /// Captures left unprocessed because their text embedding failed
+    /// transiently and will be retried.
+    pub texts_pending: usize,
+}
+
+/// How one capture's image leg ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ImageLeg {
+    /// Embedded now, or already present.
+    Done,
+    /// Nothing to do, ever (no JPEG, refused input, embeddings disabled by
+    /// configuration).
+    Terminal,
+    /// Transient — the caller must not mark the capture finished.
+    Retry,
+    /// The embedder itself is switched off; stop draining this queue.
+    Unavailable,
 }
 
 /// Poll `data_root` for unprocessed captures every `interval`.
@@ -84,17 +124,23 @@ pub async fn enrich_once(
             .to_string();
 
         let ukg = Ukg::open(&dir.join("ukg.db"))?;
-        let pending: Vec<(i64, Option<i64>, Option<String>)> = {
+
+        // Queue 1: already-processed captures with no image embedding (or a
+        // pending one). Empty on a fresh install's first pass.
+        let backfill = ukg.captures_needing_image_embedding(BATCH)?;
+
+        // Queue 2: fresh captures — both legs inline.
+        let fresh: Vec<(i64, Option<i64>, Option<String>)> = {
             let mut stmt = ukg.conn().prepare(
                 "SELECT \"Id\",\"TimeStamp\",\"ImageToken\" FROM \"WindowCapture\"
-                 WHERE \"IsProcessed\" = 0 LIMIT 64",
+                 WHERE \"IsProcessed\" = 0 ORDER BY \"Id\" LIMIT ?",
             )?;
             let rows = stmt
-                .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+                .query_map([BATCH], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
                 .collect::<Result<Vec<_>, _>>()?;
             rows
         };
-        if pending.is_empty() {
+        if backfill.is_empty() && fresh.is_empty() {
             continue;
         }
 
@@ -102,7 +148,37 @@ pub async fn enrich_once(
         let image_index = SemanticIndex::open(&dir.join("SemanticImageStore.db"), dim, "image")?;
         let objects = ObjectStore::encrypted(dir.join("objects"), object_key)?;
 
-        for (wc_id, ts, image_token) in pending {
+        // --- Queue 1: backfill / retry (image leg only) ---------------------
+        //
+        // The await sits between `image_step` and `image_record` rather than
+        // inside a helper that takes `&Ukg`/`&SemanticIndex`: both wrap a
+        // `rusqlite::Connection` (Send but *not* Sync), so a reference to one
+        // held across an await makes this future non-Send and `tokio::spawn` in
+        // `spawn_enricher` stops compiling.
+        let mut stop_images = false;
+        for (wc_id, ts, token) in backfill {
+            let step = image_step(
+                &ukg, &image_index, &objects, &client, wc_id, ts, &token, &mut stats,
+            )?;
+            let leg = match step {
+                ImageStep::Embed { jpeg, attempts } => {
+                    let outcome = embedder.embed_image(&jpeg).await;
+                    image_record(&ukg, &image_index, wc_id, attempts, outcome, &mut stats)?
+                }
+                ImageStep::Settled(leg) => leg,
+            };
+            match leg {
+                ImageLeg::Done => stats.backfilled += 1,
+                ImageLeg::Unavailable => {
+                    stop_images = true;
+                    break;
+                }
+                ImageLeg::Terminal | ImageLeg::Retry => {}
+            }
+        }
+
+        // --- Queue 2: fresh captures (text + image legs) --------------------
+        for (wc_id, ts, image_token) in fresh {
             let item = SemanticIndex::item_id_for_capture(wc_id);
 
             // --- text leg: OCR regions → SemanticTextStore -----------------
@@ -112,52 +188,200 @@ pub async fn enrich_once(
                 .filter_map(|(_, _, ocr, _)| ocr.clone())
                 .collect::<Vec<_>>()
                 .join(" ");
+            let mut text_retry = false;
             if !text.is_empty() && !text_index.has_item(&item)? {
-                if let Some(emb) = embedder.embed_text(&text).await {
-                    text_index.insert(&item, None, None, &emb)?;
-                    stats.text_embeddings += 1;
+                match embedder.embed_text(&text).await {
+                    EmbedOutcome::Ok(emb) => {
+                        text_index.insert(&item, None, None, &emb)?;
+                        stats.text_embeddings += 1;
+                    }
+                    EmbedOutcome::Disabled => {}
+                    EmbedOutcome::Rejected => {
+                        warn!(client, wc_id, "text embedder refused the input; marking processed")
+                    }
+                    EmbedOutcome::Retry => {
+                        text_retry = true;
+                        stats.texts_pending += 1;
+                    }
                 }
-                for (label, score) in embedder.topics(&text).await {
-                    ukg.attach_topic(wc_id, &label, score)?;
+                // The `has_item` guard above means topics are attached exactly
+                // once, even when a later leg forces a retry of this capture.
+                if !text_retry {
+                    for (label, score) in embedder.topics(&text).await {
+                        ukg.attach_topic(wc_id, &label, score)?;
+                    }
                 }
             }
 
             // --- image leg: stored JPEG → SemanticImageStore ---------------
-            match (image_token, ts) {
-                (Some(token), Some(ts)) => {
-                    // The guard makes the pass restart-safe: an insert that
-                    // succeeded before a crash must not be duplicated.
-                    if !image_index.has_item(&item)? {
-                        let rel = ObjectStore::key_path(
-                            &client,
-                            ymd_from_filetime(ts),
-                            &token,
-                            "jpg",
-                        );
-                        if objects.exists(&rel) {
-                            let jpeg = objects.get(&client, &rel, &token)?;
-                            match embedder.embed_image(&jpeg).await {
-                                Some(emb) => {
-                                    image_index.insert(&item, None, None, &emb)?;
-                                    stats.image_embeddings += 1;
-                                }
-                                None => warn!(
-                                    client, wc_id,
-                                    "image embedder unavailable — processed without an image embedding"
-                                ),
-                            }
-                        } else {
-                            stats.images_skipped += 1;
-                            debug!(client, wc_id, "no jpeg object for capture");
-                        }
+            let image_leg = if stop_images {
+                ImageLeg::Unavailable
+            } else if let Some(token) = image_token {
+                let step = image_step(
+                    &ukg, &image_index, &objects, &client, wc_id, ts, &token, &mut stats,
+                )?;
+                match step {
+                    ImageStep::Embed { jpeg, attempts } => {
+                        let outcome = embedder.embed_image(&jpeg).await;
+                        image_record(&ukg, &image_index, wc_id, attempts, outcome, &mut stats)?
                     }
+                    ImageStep::Settled(leg) => leg,
                 }
-                _ => stats.images_skipped += 1,
+            } else {
+                stats.images_skipped += 1;
+                ImageLeg::Terminal
+            };
+            if image_leg == ImageLeg::Unavailable {
+                stop_images = true;
             }
 
-            ukg.mark_processed(wc_id)?;
+            // Only a capture with nothing left to retry may leave the queue.
+            if !text_retry && image_leg != ImageLeg::Retry {
+                ukg.mark_processed(wc_id)?;
+            }
         }
     }
 
     Ok(stats)
 }
+
+/// What to do with one capture's image leg, decided without any `await`.
+///
+/// Split from [`image_record`] so the embedder call happens in the caller's
+/// scope: a `&Ukg`/`&SemanticIndex` held across an await would make the pass
+/// non-`Send`.
+enum ImageStep {
+    /// Hand `jpeg` to the embedder, then call [`image_record`] with the
+    /// attempt count.
+    Embed { jpeg: Vec<u8>, attempts: i64 },
+    /// Nothing to embed — already settled.
+    Settled(ImageLeg),
+}
+
+/// Everything the image leg needs before the embedder call: read the object,
+/// check the recorded state, and settle the cases that need no embedding.
+#[allow(clippy::too_many_arguments)]
+fn image_step(
+    ukg: &Ukg,
+    image_index: &SemanticIndex,
+    objects: &ObjectStore,
+    client: &str,
+    wc_id: i64,
+    ts: Option<i64>,
+    token: &str,
+    stats: &mut EnrichStats,
+) -> anyhow::Result<ImageStep> {
+    let item = SemanticIndex::item_id_for_capture(wc_id);
+
+    // Restart safety: an insert that succeeded before a crash must not be
+    // repeated, whatever the state row says.
+    if image_index.has_item(&item)? {
+        return Ok(ImageStep::Settled(ImageLeg::Done));
+    }
+
+    let prior = ukg.image_embedding_state(wc_id)?;
+    let attempts = prior.as_ref().map(|(_, a, _)| *a).unwrap_or(0);
+    if let Some((state, _, err)) = &prior {
+        if state == "skipped" {
+            debug!(
+                client, wc_id, attempts,
+                err = err.as_deref(),
+                "image embedding previously refused; not retrying"
+            );
+            stats.images_skipped += 1;
+            return Ok(ImageStep::Settled(ImageLeg::Terminal));
+        }
+    }
+
+    let now = precall_proto::time::filetime_now() as i64;
+    let Some(ts) = ts else {
+        // Without a timestamp the object key cannot be rebuilt. Terminal, with
+        // the reason recorded so an operator can see why.
+        ukg.set_image_embedding_state(wc_id, "skipped", attempts + 1, Some("no timestamp"), now)?;
+        stats.images_skipped += 1;
+        return Ok(ImageStep::Settled(ImageLeg::Terminal));
+    };
+
+    let rel = ObjectStore::key_path(client, ymd_from_filetime(ts), token, "jpg");
+    if !objects.exists(&rel) {
+        let raw = ObjectStore::key_path(client, ymd_from_filetime(ts), token, "raw");
+        if objects.exists(&raw) {
+            // Non-JPEG frames have no decode path here: the embedders take
+            // encoded images. Retrying would never change that.
+            ukg.set_image_embedding_state(
+                wc_id,
+                "skipped",
+                attempts + 1,
+                Some("non-JPEG frame"),
+                now,
+            )?;
+            stats.images_skipped += 1;
+            return Ok(ImageStep::Settled(ImageLeg::Terminal));
+        }
+        // The metadata arrived but the object is not there (or not yet).
+        ukg.set_image_embedding_state(
+            wc_id,
+            "pending",
+            attempts + 1,
+            Some("object missing"),
+            now,
+        )?;
+        stats.images_pending += 1;
+        return Ok(ImageStep::Settled(ImageLeg::Retry));
+    }
+
+    let jpeg = objects.get(client, &rel, token)?;
+    Ok(ImageStep::Embed { jpeg, attempts })
+}
+
+/// Record the embedder's verdict in `PrecallImageEmbedding` so the next pass
+/// knows whether this capture may be forgotten or must be retried.
+fn image_record(
+    ukg: &Ukg,
+    image_index: &SemanticIndex,
+    wc_id: i64,
+    attempts: i64,
+    outcome: EmbedOutcome,
+    stats: &mut EnrichStats,
+) -> anyhow::Result<ImageLeg> {
+    let now = precall_proto::time::filetime_now() as i64;
+    match outcome {
+        EmbedOutcome::Ok(emb) => {
+            let item = SemanticIndex::item_id_for_capture(wc_id);
+            image_index.insert(&item, None, None, &emb)?;
+            ukg.set_image_embedding_state(wc_id, "done", attempts + 1, None, now)?;
+            stats.image_embeddings += 1;
+            Ok(ImageLeg::Done)
+        }
+        EmbedOutcome::Disabled => {
+            stats.images_skipped += 1;
+            Ok(ImageLeg::Unavailable)
+        }
+        EmbedOutcome::Rejected => {
+            // The service refused these bytes; retrying cannot help.
+            ukg.set_image_embedding_state(
+                wc_id,
+                "skipped",
+                attempts + 1,
+                Some("embedder refused input"),
+                now,
+            )?;
+            stats.images_skipped += 1;
+            Ok(ImageLeg::Terminal)
+        }
+        EmbedOutcome::Retry => {
+            ukg.set_image_embedding_state(
+                wc_id,
+                "pending",
+                attempts + 1,
+                Some("embedder unavailable"),
+                now,
+            )?;
+            stats.images_pending += 1;
+            Ok(ImageLeg::Retry)
+        }
+    }
+}
+
+/// Captures handled per queue per pass.
+const BATCH: i64 = 64;

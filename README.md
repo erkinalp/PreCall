@@ -83,11 +83,30 @@ returned as "no matches". The legs are:
 | `image-semantic` | `image` (base64 JPEG or data URL) is supplied | screenshots embedded into `SemanticImageStore.db` |
 | `image-text` | `mode` is `hybrid`/`semantic` and the AI service has CLIP | `ai-cpu`/`ai-cuda` extra (`/embed/image-text`) |
 
-Results are ranked by relevance (`relevance_score`), with recency only as a
-tie-break. `/embed/image-text` deliberately answers **501** when no CLIP stack
-is installed: the deterministic hash fallback has no shared text/image space,
-so answering with a hash embedding would turn text→image search into an
-arbitrary ranker.
+Results are ranked by **relevance**, with recency only as a tie-break.
+`relevance_score` is a reciprocal-rank-fusion score (higher is better), not a
+cosine similarity: legs are fused by `rank` because SQLite `bm25` and cosine
+are different scales, and mixing them let an unrelated vector hit outrank an
+exact lexical match. Within a leg, a semantic candidate with no positive
+similarity is dropped — the flat scan returns every stored item, so the
+zero/negative tail is the whole store, not a match.
+
+`time_range` and `app_filter` apply to **every** leg, including `mode=image`
+where there is no FTS leg to apply them instead.
+
+A search that needs the AI service reports its state honestly: `notes` names a
+leg that could not run, and an image query returns **503** while the service is
+down (retryable) rather than an empty result set. `/embed/image-text`
+deliberately answers **501** when no CLIP stack is installed: the deterministic
+hash fallback has no shared text/image space, so answering with a hash
+embedding would turn text→image search into an arbitrary ranker.
+
+Image embeddings survive the two cases a `IsProcessed` flag cannot express:
+captures processed by an older, text-only build are **backfilled** from the
+stored screenshots, and a capture whose embedding failed while the AI service
+was down is **retried** rather than lost. Per-capture state lives in
+`PrecallImageEmbedding` (`pending`/`done`/`skipped`); `skipped` records why
+(no timestamp, non-JPEG frame, refused input) and is never retried.
 
 ## Repo layout
 

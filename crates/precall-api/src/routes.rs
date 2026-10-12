@@ -3,7 +3,7 @@
 //! `Send` but not `Sync`; WAL makes concurrent readers cheap).
 
 use crate::auth::{require_auth, ApiAuth};
-use crate::embed::Embedder;
+use crate::embed::{EmbedOutcome, Embedder};
 use crate::ApiError;
 use axum::extract::{Path as AxPath, Query, State, WebSocketUpgrade};
 use axum::http::StatusCode;
@@ -135,29 +135,76 @@ fn decode_image_query(s: &str) -> Result<Vec<u8>, ApiError> {
         .map_err(|e| ApiError::BadRequest(format!("image is not valid base64: {e}")))
 }
 
-/// Merge semantic-space hits into the ranked map, mirroring the score bump the
-/// flat cosine scan gives to earlier ranks.
-fn merge_semantic(
+/// Reciprocal-rank-fusion constant (Cormack et al., 2009).
+///
+/// Legs are fused by **rank**, never by raw score: SQLite `bm25` values and
+/// cosine similarities are different scales, and mixing them made an unrelated
+/// semantic candidate outrank an exact lexical match in small corpora where the
+/// BM25 magnitude collapses to ~1e-6.
+const RRF_K: f64 = 60.0;
+
+/// A semantic candidate with no positive similarity is not evidence of
+/// similarity: the flat cosine scan returns *every* stored item, so the
+/// zero/negative tail is the whole store, not a match.
+const MIN_SEMANTIC_SCORE: f32 = 0.0;
+
+/// Resolve ranked semantic hits into ranked capture ids plus their metadata,
+/// dropping non-evidence (score ≤ 0) and anything the caller's time/app filters
+/// exclude.
+///
+/// The filters must be applied here and not only in the FTS SQL: in
+/// `mode=image` there is no FTS leg at all, so an unfiltered semantic merge
+/// happily returns captures outside the requested window or application.
+fn semantic_candidates(
     db: &Ukg,
-    hits: &mut HashMap<i64, precall_store::SearchHit>,
     semantic: &[precall_store::EmbeddingHit],
-    limit: i64,
-) -> Result<(), ApiError> {
-    let mut related = db.captures_by_ids(
-        &semantic
-            .iter()
-            .filter_map(|h| SemanticIndex::capture_id_for_item(&h.item_id))
-            .collect::<Vec<_>>(),
-    )?;
-    for (rank, sh) in semantic.iter().enumerate() {
-        if let Some(cid) = SemanticIndex::capture_id_for_item(&sh.item_id) {
-            if let Some(entry) = related.get_mut(&cid) {
-                entry.score = sh.score as f64 + (limit as f64 - rank as f64) * 1e-4;
-                hits.entry(cid).or_insert_with(|| entry.clone());
+    start: Option<i64>,
+    end: Option<i64>,
+    app_filter: &[String],
+) -> Result<(Vec<i64>, HashMap<i64, precall_store::SearchHit>), ApiError> {
+    let mut ids: Vec<i64> = Vec::new();
+    for h in semantic {
+        if h.score <= MIN_SEMANTIC_SCORE {
+            continue;
+        }
+        if let Some(id) = SemanticIndex::capture_id_for_item(&h.item_id) {
+            if !ids.contains(&id) {
+                ids.push(id);
             }
         }
     }
-    Ok(())
+    let meta = db.captures_by_ids(&ids)?;
+    let mut ordered: Vec<i64> = Vec::new();
+    for id in ids {
+        let Some(h) = meta.get(&id) else { continue };
+        if start.is_some_and(|s| h.timestamp_100ns < s) {
+            continue;
+        }
+        if end.is_some_and(|e| h.timestamp_100ns > e) {
+            continue;
+        }
+        ordered.push(id);
+    }
+    if !app_filter.is_empty() {
+        let allowed = db.ids_matching_app_filter(&ordered, app_filter)?;
+        ordered.retain(|id| allowed.contains(id));
+    }
+    Ok((ordered, meta))
+}
+
+/// Reciprocal rank fusion over one id list per leg that ran.
+///
+/// Ranks are the only input, so a leg whose scores are on a wildly different
+/// scale cannot swamp another: a capture found by two legs accumulates both
+/// contributions and outranks one found by a single leg at the same rank.
+fn reciprocal_rank_fusion(leg_ranks: &[Vec<i64>]) -> HashMap<i64, f64> {
+    let mut fused: HashMap<i64, f64> = HashMap::new();
+    for ids in leg_ranks {
+        for (rank, id) in ids.iter().enumerate() {
+            *fused.entry(*id).or_insert(0.0) += 1.0 / (RRF_K + rank as f64 + 1.0);
+        }
+    }
+    fused
 }
 
 async fn search(
@@ -200,6 +247,10 @@ async fn search(
         .unwrap_or((None, None));
 
     let mut hits: HashMap<i64, precall_store::SearchHit> = HashMap::new();
+    // Each leg's capture ids in rank order. Fusion uses only these ranks.
+    let mut leg_ranks: Vec<Vec<i64>> = Vec::new();
+    // Captures the lexical leg found — used to break fused-score ties.
+    let mut fts_ids: std::collections::HashSet<i64> = std::collections::HashSet::new();
     let mut legs: Vec<&'static str> = Vec::new();
     let mut notes: Vec<String> = Vec::new();
 
@@ -212,9 +263,13 @@ async fn search(
             app_filter: body.app_filter.clone(),
             limit: Some(limit),
         };
+        let mut ids = Vec::new();
         for h in db.search_fts(&opts)? {
+            ids.push(h.window_capture_id);
+            fts_ids.insert(h.window_capture_id);
             hits.insert(h.window_capture_id, h);
         }
+        leg_ranks.push(ids);
         legs.push("fts");
     }
 
@@ -222,17 +277,32 @@ async fn search(
 
     // Text query → text space.
     if (mode == "hybrid" || mode == "semantic") && has_query {
-        if let Some(qemb) = st.embedder.embed_text(&body.query).await {
-            let idx = SemanticIndex::open(
-                &dir.join("SemanticTextStore.db"),
-                st.embedding_dim,
-                "text",
-            )?;
-            let found = idx.search(&qemb, (limit * 2) as usize)?;
-            merge_semantic(&db, &mut hits, &found, limit)?;
-            legs.push("text-semantic");
-        } else {
-            notes.push("text embedding unavailable (embedder disabled)".into());
+        match st.embedder.embed_text(&body.query).await {
+            EmbedOutcome::Ok(qemb) => {
+                let idx = SemanticIndex::open(
+                    &dir.join("SemanticTextStore.db"),
+                    st.embedding_dim,
+                    "text",
+                )?;
+                let found = idx.search(&qemb, (limit * 2) as usize)?;
+                let (ids, meta) =
+                    semantic_candidates(&db, &found, start, end, &body.app_filter)?;
+                // Only survivors may enter the result set: a candidate the
+                // filters excluded must not come back with a zero score.
+                for id in &ids {
+                    if let Some(h) = meta.get(id) {
+                        hits.entry(*id).or_insert_with(|| h.clone());
+                    }
+                }
+                leg_ranks.push(ids);
+                legs.push("text-semantic");
+            }
+            EmbedOutcome::Disabled => {
+                notes.push("text-semantic leg skipped: no embedder configured".into())
+            }
+            EmbedOutcome::Rejected | EmbedOutcome::Retry => notes.push(
+                "text-semantic leg skipped: the AI service did not answer (FTS results only)".into(),
+            ),
         }
     }
 
@@ -243,19 +313,38 @@ async fn search(
             return Err(ApiError::BadRequest("image query is empty".into()));
         }
         match st.embedder.embed_image(&raw).await {
-            Some(emb) => {
+            EmbedOutcome::Ok(emb) => {
                 let idx = SemanticIndex::open(
                     &dir.join("SemanticImageStore.db"),
                     st.embedding_dim,
                     "image",
                 )?;
                 let found = idx.search(&emb, (limit * 2) as usize)?;
-                merge_semantic(&db, &mut hits, &found, limit)?;
+                let (ids, meta) =
+                    semantic_candidates(&db, &found, start, end, &body.app_filter)?;
+                // Only survivors may enter the result set: a candidate the
+                // filters excluded must not come back with a zero score.
+                for id in &ids {
+                    if let Some(h) = meta.get(id) {
+                        hits.entry(*id).or_insert_with(|| h.clone());
+                    }
+                }
+                leg_ranks.push(ids);
                 legs.push("image-semantic");
             }
-            None => {
+            EmbedOutcome::Disabled => {
                 return Err(ApiError::BadRequest(
-                    "image embedding unavailable (embedder disabled)".into(),
+                    "image embedding unavailable (no embedder configured)".into(),
+                ))
+            }
+            EmbedOutcome::Rejected => {
+                return Err(ApiError::BadRequest(
+                    "the AI service refused this image (undecodable frame?)".into(),
+                ))
+            }
+            EmbedOutcome::Retry => {
+                return Err(ApiError::Unavailable(
+                    "the AI service is not answering; image search needs it".into(),
                 ))
             }
         }
@@ -267,32 +356,66 @@ async fn search(
     // "no matches".
     if (mode == "hybrid" || mode == "semantic") && has_query {
         match st.embedder.embed_image_text(&body.query).await {
-            Some(emb) => {
+            EmbedOutcome::Ok(emb) => {
                 let idx = SemanticIndex::open(
                     &dir.join("SemanticImageStore.db"),
                     st.embedding_dim,
                     "image",
                 )?;
                 let found = idx.search(&emb, (limit * 2) as usize)?;
-                merge_semantic(&db, &mut hits, &found, limit)?;
+                let (ids, meta) =
+                    semantic_candidates(&db, &found, start, end, &body.app_filter)?;
+                // Only survivors may enter the result set: a candidate the
+                // filters excluded must not come back with a zero score.
+                for id in &ids {
+                    if let Some(h) = meta.get(id) {
+                        hits.entry(*id).or_insert_with(|| h.clone());
+                    }
+                }
+                leg_ranks.push(ids);
                 legs.push("image-text");
             }
-            None => notes.push(
+            EmbedOutcome::Disabled => notes.push(
                 "text→image leg skipped: needs a CLIP-backed AI service (/embed/image-text)".into(),
+            ),
+            EmbedOutcome::Rejected | EmbedOutcome::Retry => notes.push(
+                "text→image leg skipped: the AI service did not answer (/embed/image-text)".into(),
             ),
         }
     }
 
+    // Reciprocal rank fusion across the legs that ran.
+    let fused = reciprocal_rank_fusion(&leg_ranks);
+    for (id, h) in hits.iter_mut() {
+        h.score = fused.get(id).copied().unwrap_or(0.0);
+    }
+
+    // Anything no leg ranked contributes nothing; it must not appear as a
+    // zero-score "match".
+    hits.retain(|id, _| fused.contains_key(id));
+
     let mut results: Vec<_> = hits.into_values().collect();
-    // Relevance first, recency only as a tie-break: FTS hits carry `-bm25`
-    // (higher = better) and semantic/image hits carry cosine similarity, so
-    // both legs are comparable. Sorting by recency first — which this route
-    // used to do — buries an exact image or semantic match under whatever
-    // capture happened to be newest, and makes `relevance_score` decorative.
+    // Relevance first, recency only as a tie-break. The old route sorted by
+    // recency first, which buried an exact match under whatever capture
+    // happened to be newest and left `relevance_score` decorative.
     results.sort_by(|a, b| {
         b.score
             .partial_cmp(&a.score)
             .unwrap_or(std::cmp::Ordering::Equal)
+            // Rank fusion cannot separate two rank-1 hits from different legs,
+            // and a vector hit is ranked against *every* stored item, so an
+            // exact lexical match must not lose that tie to a recent
+            // similarity score. Lexical first, then recency.
+            .then_with(|| {
+                match (
+                    fts_ids.contains(&b.window_capture_id),
+                    fts_ids.contains(&a.window_capture_id),
+                ) {
+                    (true, false) => std::cmp::Ordering::Greater,
+                    (false, true) => std::cmp::Ordering::Less,
+                    _ => std::cmp::Ordering::Equal,
+                }
+            })
             .then(b.timestamp_100ns.cmp(&a.timestamp_100ns))
     });
     results.truncate(limit as usize);
@@ -555,5 +678,40 @@ impl IntoResponse for ApiError {
         let message = self.to_string();
         let status = StatusCode::from(self);
         (status, message).into_response()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A capture both legs found must outrank one only a single leg found,
+    /// whatever the legs' raw scores looked like — that is the whole point of
+    /// fusing ranks instead of scores (SQLite `bm25` vs. cosine).
+    #[test]
+    fn rrf_rewards_agreement_between_legs() {
+        let both = reciprocal_rank_fusion(&[vec![1], vec![1]]);
+        let one = reciprocal_rank_fusion(&[vec![1]]);
+        assert!(both[&1] > one[&1]);
+
+        let fused = reciprocal_rank_fusion(&[vec![1, 2], vec![2, 3]]);
+        assert!(fused[&2] > fused[&1], "agreement must win");
+        assert!(fused[&2] > fused[&3], "agreement must win");
+    }
+
+    #[test]
+    fn rrf_preserves_single_leg_order() {
+        let fused = reciprocal_rank_fusion(&[vec![7, 8, 9]]);
+        assert!(fused[&7] > fused[&8] && fused[&8] > fused[&9]);
+    }
+
+    /// The fusion function takes only ranks, so an exact lexical match cannot
+    /// be pushed down by a semantic leg whose magnitudes happen to be larger:
+    /// rank 1 of any leg carries identical weight.
+    #[test]
+    fn rrf_is_scale_free() {
+        let fused = reciprocal_rank_fusion(&[vec![1], vec![2, 3, 4, 5]]);
+        assert_eq!(fused[&1], fused[&2]);
+        assert!(fused[&2] > fused[&3] && fused[&3] > fused[&4] && fused[&4] > fused[&5]);
     }
 }

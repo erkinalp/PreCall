@@ -45,8 +45,7 @@ class TextEmbedder:
     def __post_init__(self) -> None:
         self._model = None
         self.backend = "hash"
-        if self.device in {"cuda", "rocm"}:
-            self.device = "cuda"
+        self.device = normalize_device(self.device)
         try:
             import torch  # noqa: F401
 
@@ -91,6 +90,7 @@ class ImageEmbedder:
     device: str = "cpu"
 
     def __post_init__(self) -> None:
+        self.device = normalize_device(self.device)
         loaded = _load_clip(self.device)
         if loaded is None:
             self._model = None
@@ -115,6 +115,16 @@ class ImageEmbedder:
         return hash_embedding_bytes(jpeg)
 
 
+def normalize_device(device: str) -> str:
+    """Map our device vocabulary onto what PyTorch accepts.
+
+    ``rocm`` is *our* name for the extra; PyTorch exposes ROCm through the CUDA
+    device API, so ``.to("rocm")`` raises and the caller would silently fall
+    back to the hash backend on exactly the hardware the ROCm extra is for.
+    """
+    return "cuda" if device in {"cuda", "rocm"} else device
+
+
 def _load_clip(device: str):
     """Load the CLIP checkpoint once; ``None`` when the stack is absent.
 
@@ -127,7 +137,8 @@ def _load_clip(device: str):
         import torch
         from transformers import CLIPModel, CLIPProcessor
 
-        if device in {"cuda", "rocm"} and not torch.cuda.is_available():
+        device = normalize_device(device)
+        if device == "cuda" and not torch.cuda.is_available():
             device = "cpu"
         model = CLIPModel.from_pretrained(CLIP_MODEL_NAME).to(device)
         processor = CLIPProcessor.from_pretrained(CLIP_MODEL_NAME)

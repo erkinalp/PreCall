@@ -15,7 +15,9 @@ from precall_ai.providers import (
     DIM,
     ImageEmbedder,
     ImageTextEmbedder,
+    TextEmbedder,
     hash_embedding,
+    normalize_device,
     project_clip,
     TopicExtractor,
 )
@@ -144,3 +146,21 @@ def test_project_clip_truncates_and_renormalises() -> None:
     tail_changed = full.copy()
     tail_changed[DIM:] += 100.0
     np.testing.assert_allclose(project_clip(tail_changed, DIM), p)
+
+
+def test_rocm_maps_onto_the_cuda_device_api() -> None:
+    """`rocm` is our extra's name, not a PyTorch device string.
+
+    PyTorch exposes ROCm through the CUDA API, so passing "rocm" through to
+    `.to(...)` raises and the encoder silently falls back to the hash backend
+    on exactly the hardware the ROCm extra exists for.
+    """
+    assert normalize_device("rocm") == "cuda"
+    assert normalize_device("cuda") == "cuda"
+    assert normalize_device("cpu") == "cpu"
+    assert normalize_device("mps") == "mps"
+    # Normalised before the model is loaded, so it survives the hash fallback.
+    assert TextEmbedder(device="rocm").device == "cuda"
+    assert ImageEmbedder(device="rocm").device == "cuda"
+    ite = ImageTextEmbedder.from_encoder(ImageEmbedder(device="rocm"))
+    assert ite.device == "cuda"

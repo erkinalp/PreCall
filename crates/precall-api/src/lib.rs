@@ -21,7 +21,7 @@ mod embed;
 pub mod enrich;
 mod routes;
 
-pub use embed::{Embedder, EMBED_DIM};
+pub use embed::{EmbedOutcome, Embedder, EMBED_DIM};
 pub use routes::{build_router, ApiState};
 
 use thiserror::Error;
@@ -44,6 +44,11 @@ pub enum ApiError {
     Unauthorized,
     #[error("not found: {0}")]
     NotFound(String),
+    /// A dependency this request cannot be served without is down (e.g. image
+    /// search without an answering AI service). Distinct from `BadRequest`:
+    /// the same request may succeed later.
+    #[error("unavailable: {0}")]
+    Unavailable(String),
     #[error("{0}")]
     Anyhow(#[from] anyhow::Error),
     #[error("upstream: {0}")]

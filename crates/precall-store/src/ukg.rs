@@ -422,8 +422,46 @@ impl Ukg {
         Ok(map)
     }
 
-    pub fn app_dwell(&self) -> Result<Vec<AppDwellEntry>, UkgError> {
-        let mut stmt = self.conn.prepare(
+    /// Subset of `ids` linked to an app whose `Path` or `Name` is in `filter` —
+    /// the same predicate [`Ukg::search_fts`] applies in SQL, exposed so the
+    /// semantic legs can apply the caller's filter too (in `mode=image` there
+    /// is no FTS leg to do it for them).
+    pub fn ids_matching_app_filter(
+        &self,
+        ids: &[i64],
+        filter: &[String],
+    ) -> Result<std::collections::HashSet<i64>, UkgError> {
+        let mut out = std::collections::HashSet::new();
+        if ids.is_empty() || filter.is_empty() {
+            return Ok(out);
+        }
+        let id_marks = vec!["?"; ids.len()].join(",");
+        let app_marks = vec!["?"; filter.len()].join(",");
+        let sql = format!(
+            "SELECT DISTINCT r.\"WindowCaptureId\" FROM \"WindowCaptureAppRelation\" r
+             JOIN \"App\" a ON a.\"Id\" = r.\"AppId\"
+             WHERE (a.\"Path\" IN ({app_marks}) OR a.\"Name\" IN ({app_marks}))
+               AND r.\"WindowCaptureId\" IN ({id_marks})"
+        );
+        let mut vals: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+        for _ in 0..2 {
+            for f in filter {
+                vals.push(Box::new(f.clone()));
+            }
+        }
+        for id in ids {
+            vals.push(Box::new(*id));
+        }
+        let refs: Vec<&dyn rusqlite::ToSql> = vals.iter().map(|v| v.as_ref()).collect();
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map(&refs[..], |r| r.get::<_, i64>(0))?;
+        for row in rows {
+            out.insert(row?);
+        }
+        Ok(out)
+    }
+
+    pub fn app_dwell(&self) -> Result<Vec<AppDwellEntry>, UkgError> {        let mut stmt = self.conn.prepare(
             "SELECT \"WindowsAppId\",\"HourOfDay\",\"DayOfWeek\",\"HourStartTimestamp\",\"DwellTime\"
              FROM \"AppDwellTime\" ORDER BY \"HourStartTimestamp\" DESC LIMIT 10000",
         )?;
@@ -522,6 +560,73 @@ impl Ukg {
             .optional()?)
     }
 
+    // -- image-embedding state -----------------------------------------------
+
+    /// `(State, Attempts, LastError)` for a capture's image embedding.
+    pub fn image_embedding_state(
+        &self,
+        wc_id: i64,
+    ) -> Result<Option<(String, i64, Option<String>)>, UkgError> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT \"State\",\"Attempts\",\"LastError\" FROM \"PrecallImageEmbedding\"
+                 WHERE \"WindowCaptureId\" = ?",
+                params![wc_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()?)
+    }
+
+    /// Record the outcome of one image-embedding attempt.
+    pub fn set_image_embedding_state(
+        &self,
+        wc_id: i64,
+        state: &str,
+        attempts: i64,
+        last_error: Option<&str>,
+        now: i64,
+    ) -> Result<(), UkgError> {
+        self.conn.execute(
+            "INSERT INTO \"PrecallImageEmbedding\"
+             (\"WindowCaptureId\",\"State\",\"Attempts\",\"LastError\",\"UpdatedAt\")
+             VALUES (?,?,?,?,?)
+             ON CONFLICT(\"WindowCaptureId\") DO UPDATE SET
+               \"State\" = excluded.\"State\",
+               \"Attempts\" = excluded.\"Attempts\",
+               \"LastError\" = excluded.\"LastError\",
+               \"UpdatedAt\" = excluded.\"UpdatedAt\"",
+            params![wc_id, state, attempts, last_error, now],
+        )?;
+        Ok(())
+    }
+
+    /// Captures that still need an image embedding even though their text leg
+    /// is already done — the backfill/retry queue.
+    ///
+    /// Excludes `IsProcessed = 0` rows on purpose: those are the enrichment
+    /// loop's *fresh* captures, which run the image leg inline. A capture that
+    /// failed transiently is left `pending` here and returns on the next pass;
+    /// one whose input was refused is `skipped` and never retried.
+    pub fn captures_needing_image_embedding(
+        &self,
+        limit: i64,
+    ) -> Result<Vec<(i64, Option<i64>, String)>, UkgError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT w.\"Id\", w.\"TimeStamp\", w.\"ImageToken\"
+             FROM \"WindowCapture\" w
+             LEFT JOIN \"PrecallImageEmbedding\" e ON e.\"WindowCaptureId\" = w.\"Id\"
+             WHERE w.\"ImageToken\" IS NOT NULL
+               AND w.\"IsProcessed\" = 1
+               AND (e.\"State\" IS NULL OR e.\"State\" = 'pending')
+             ORDER BY w.\"Id\" LIMIT ?",
+        )?;
+        let rows = stmt.query_map(params![limit], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+        })?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
     /// Delete every trace of a client (panic button).
     pub fn purge_all(&self) -> Result<(), UkgError> {
         self.conn.execute_batch(
@@ -534,7 +639,8 @@ impl Ukg {
              DELETE FROM \"WindowCapture\";
              DELETE FROM \"AppDwellTime\";
              DELETE FROM \"WebDomainDwellTime\";
-             DELETE FROM \"PrecallSyncState\";",
+             DELETE FROM \"PrecallSyncState\";
+             DELETE FROM \"PrecallImageEmbedding\";",
         )?;
         Ok(())
     }

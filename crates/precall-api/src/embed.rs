@@ -13,6 +13,24 @@ use sha2::{Digest, Sha256};
 
 pub const EMBED_DIM: usize = 384;
 
+/// Why an embedding call ended the way it did.
+///
+/// `Option<Vec<f32>>` cannot express this, and the enrichment loop needs the
+/// distinction: a capture whose embedding failed because the AI service was
+/// down must be retried, while one whose *input* the service refused will never
+/// succeed and must stop consuming attempts.
+#[derive(Debug, Clone, PartialEq)]
+pub enum EmbedOutcome {
+    /// The vector.
+    Ok(Vec<f32>),
+    /// No embedder is configured — nothing to retry.
+    Disabled,
+    /// Upstream refused this input (4xx, e.g. an undecodable frame).
+    Rejected,
+    /// Transport error, timeout or 5xx — retry later.
+    Retry,
+}
+
 #[derive(Debug, Clone)]
 pub enum Embedder {
     /// `http://host:port` of the AI service.
@@ -35,8 +53,8 @@ impl Embedder {
         }
     }
 
-    /// Embed text → `dim` f32s. `None` when disabled.
-    pub async fn embed_text(&self, text: &str) -> Option<Vec<f32>> {
+    /// Embed text → `dim` f32s. `Disabled` when no embedder is configured.
+    pub async fn embed_text(&self, text: &str) -> EmbedOutcome {
         match self {
             Embedder::Http { base, client } => {
                 #[derive(serde::Serialize)]
@@ -47,42 +65,82 @@ impl Embedder {
                 struct Resp {
                     embedding: Vec<f32>,
                 }
-                let r = client
+                let r = match client
                     .post(format!("{base}/embed/text"))
                     .json(&Req { text })
                     .send()
                     .await
-                    .ok()?;
-                if !r.status().is_success() {
-                    return None;
+                {
+                    Ok(r) => r,
+                    Err(e) => {
+                        tracing::debug!("text embed request failed: {e}");
+                        return EmbedOutcome::Retry;
+                    }
+                };
+                let status = r.status();
+                if status.is_client_error() {
+                    return EmbedOutcome::Rejected;
                 }
-                let resp: Resp = r.json().await.ok()?;
-                Some(resp.embedding)
+                if !status.is_success() {
+                    return EmbedOutcome::Retry;
+                }
+                match r.json::<Resp>().await {
+                    Ok(x) => EmbedOutcome::Ok(x.embedding),
+                    Err(e) => {
+                        tracing::debug!("text embed response unreadable: {e}");
+                        EmbedOutcome::Retry
+                    }
+                }
             }
-            Embedder::Local => Some(hash_embedding(text, EMBED_DIM)),
-            Embedder::Disabled => None,
+            Embedder::Local => EmbedOutcome::Ok(hash_embedding(text, EMBED_DIM)),
+            Embedder::Disabled => EmbedOutcome::Disabled,
         }
     }
 
     /// Image embedding — same plumbing for the `si_image` space.
-    pub async fn embed_image(&self, jpeg: &[u8]) -> Option<Vec<f32>> {
+    ///
+    /// Returns an [`EmbedOutcome`] rather than an `Option` because the caller
+    /// (enrichment) must treat "retry later" and "this input is unacceptable"
+    /// differently; see [`EmbedOutcome`].
+    pub async fn embed_image(&self, jpeg: &[u8]) -> EmbedOutcome {
         match self {
             Embedder::Http { base, client } => {
                 #[derive(serde::Deserialize)]
                 struct Resp {
                     embedding: Vec<f32>,
                 }
-                let r = client
+                let r = match client
                     .post(format!("{base}/embed/image"))
                     .body(jpeg.to_vec())
                     .header(reqwest::header::CONTENT_TYPE, "image/jpeg")
                     .send()
                     .await
-                    .ok()?;
-                if !r.status().is_success() {
-                    return None;
+                {
+                    Ok(r) => r,
+                    Err(e) => {
+                        tracing::debug!("image embed request failed: {e}");
+                        return EmbedOutcome::Retry;
+                    }
+                };
+                let status = r.status();
+                if status.is_client_error() {
+                    // The service understood the request and refused this
+                    // input (bad/oversized/undecodable frame) — retrying the
+                    // same bytes cannot succeed.
+                    tracing::debug!("image embedder rejected input: {status}");
+                    return EmbedOutcome::Rejected;
                 }
-                r.json::<Resp>().await.ok().map(|r| r.embedding)
+                if !status.is_success() {
+                    tracing::debug!("image embedder unavailable: {status}");
+                    return EmbedOutcome::Retry;
+                }
+                match r.json::<Resp>().await {
+                    Ok(x) => EmbedOutcome::Ok(x.embedding),
+                    Err(e) => {
+                        tracing::debug!("image embed response unreadable: {e}");
+                        EmbedOutcome::Retry
+                    }
+                }
             }
             Embedder::Local => {
                 // Content-hash embedding for image bytes. Must be `EMBED_DIM`
@@ -103,9 +161,9 @@ impl Embedder {
                 for x in v.iter_mut() {
                     *x /= n;
                 }
-                Some(v)
+                EmbedOutcome::Ok(v)
             }
-            Embedder::Disabled => None,
+            Embedder::Disabled => EmbedOutcome::Disabled,
         }
     }
 
@@ -115,12 +173,13 @@ impl Embedder {
     /// encoded the stored screenshots. The service answers `501` when its image
     /// backend is the deterministic hash fallback, because hashed text and
     /// hashed pixels live in different spaces — searching one with the other
-    /// returns noise, not "no matches". `None` therefore means *this
+    /// returns noise, not "no matches". `Disabled` therefore means *this
     /// deployment cannot answer text queries against the image store* and
-    /// callers must report the leg as skipped.
-    pub async fn embed_image_text(&self, text: &str) -> Option<Vec<f32>> {
+    /// callers must report the leg as skipped; `Retry` means the service is
+    /// reachable in principle but not answering right now.
+    pub async fn embed_image_text(&self, text: &str) -> EmbedOutcome {
         let Embedder::Http { base, client } = self else {
-            return None;
+            return EmbedOutcome::Disabled;
         };
         #[derive(serde::Serialize)]
         struct Req<'a> {
@@ -130,16 +189,37 @@ impl Embedder {
         struct Resp {
             embedding: Vec<f32>,
         }
-        let r = client
+        let r = match client
             .post(format!("{base}/embed/image-text"))
             .json(&Req { text })
             .send()
             .await
-            .ok()?;
-        if !r.status().is_success() {
-            return None;
+        {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::debug!("image-text embed request failed: {e}");
+                return EmbedOutcome::Retry;
+            }
+        };
+        let status = r.status();
+        // 501 is the service stating, permanently, that it has no CLIP stack —
+        // not an outage.
+        if status == reqwest::StatusCode::NOT_IMPLEMENTED {
+            return EmbedOutcome::Disabled;
         }
-        r.json::<Resp>().await.ok().map(|x| x.embedding)
+        if status.is_client_error() {
+            return EmbedOutcome::Rejected;
+        }
+        if !status.is_success() {
+            return EmbedOutcome::Retry;
+        }
+        match r.json::<Resp>().await {
+            Ok(x) => EmbedOutcome::Ok(x.embedding),
+            Err(e) => {
+                tracing::debug!("image-text embed response unreadable: {e}");
+                EmbedOutcome::Retry
+            }
+        }
     }
 
     /// Topic extraction via AI service (returns [] when unavailable).
@@ -201,8 +281,12 @@ mod tests {
     #[tokio::test]
     async fn local_embedding_is_deterministic_and_normalized() {
         let e = Embedder::Local;
-        let a = e.embed_text("kerberos tickets").await.unwrap();
-        let b = e.embed_text("kerberos tickets").await.unwrap();
+        let EmbedOutcome::Ok(a) = e.embed_text("kerberos tickets").await else {
+            panic!("local embedder must succeed");
+        };
+        let EmbedOutcome::Ok(b) = e.embed_text("kerberos tickets").await else {
+            panic!("local embedder must succeed");
+        };
         assert_eq!(a, b);
         let n: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
         assert!((n - 1.0).abs() < 1e-3);
@@ -214,11 +298,57 @@ mod tests {
     #[tokio::test]
     async fn local_image_embedding_fits_the_store() {
         let e = Embedder::Local;
-        let a = e.embed_image(b"\xff\xd8scene-a\xff\xd9").await.unwrap();
-        let b = e.embed_image(b"\xff\xd8scene-b\xff\xd9").await.unwrap();
+        let EmbedOutcome::Ok(a) = e.embed_image(b"\xff\xd8scene-a\xff\xd9").await else {
+            panic!("local embedder must succeed");
+        };
+        let EmbedOutcome::Ok(b) = e.embed_image(b"\xff\xd8scene-b\xff\xd9").await else {
+            panic!("local embedder must succeed");
+        };
         assert_eq!(a.len(), EMBED_DIM);
         let n: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
         assert!((n - 1.0).abs() < 1e-3, "not normalised: {n}");
         assert_ne!(a, b);
+    }
+
+    /// A 4xx is the service refusing *this input*; a 5xx/transport failure is
+    /// the service being unavailable. The enricher depends on the difference.
+    #[tokio::test]
+    async fn image_embed_outcome_separates_rejection_from_outage() {
+        use axum::routing::post;
+        use std::net::SocketAddr;
+
+        async fn refused() -> (axum::http::StatusCode, &'static str) {
+            (axum::http::StatusCode::BAD_REQUEST, "undecodable frame")
+        }
+        async fn broken() -> (axum::http::StatusCode, &'static str) {
+            (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "gpu on fire")
+        }
+
+        async fn serve(route: axum::Router) -> SocketAddr {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            tokio::spawn(async move { axum::serve(listener, route).await });
+            addr
+        }
+
+        let refused_addr = serve(axum::Router::new().route("/embed/image", post(refused))).await;
+        let broken_addr = serve(axum::Router::new().route("/embed/image", post(broken))).await;
+        let dead_addr = {
+            // Bind and drop, so nothing is listening on that port.
+            let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let a = l.local_addr().unwrap();
+            drop(l);
+            a
+        };
+
+        let embedder = |addr: SocketAddr| Embedder::Http {
+            base: format!("http://{addr}"),
+            client: reqwest::Client::new(),
+        };
+
+        assert_eq!(embedder(refused_addr).embed_image(b"x").await, EmbedOutcome::Rejected);
+        assert_eq!(embedder(broken_addr).embed_image(b"x").await, EmbedOutcome::Retry);
+        assert_eq!(embedder(dead_addr).embed_image(b"x").await, EmbedOutcome::Retry);
+        assert_eq!(Embedder::Disabled.embed_image(b"x").await, EmbedOutcome::Disabled);
     }
 }
