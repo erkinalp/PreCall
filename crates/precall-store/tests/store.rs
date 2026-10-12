@@ -248,26 +248,41 @@ fn image_backfill_queue_rotates_and_backs_off() {
     let backoff = 60 * 10_000_000i64;
 
     // #1 failed just now; #3 failed long ago; #2 has never been attempted.
+    // The state machine and the pacing clock are separate: `set_image_embedding_state`
+    // records *what happened*, `touch_enrich_attempt` records *when*.
     db.set_image_embedding_state(ids[0], "pending", 1, Some("stub"), now)
         .unwrap();
+    db.touch_enrich_attempt(ids[0], now).unwrap();
     db.set_image_embedding_state(ids[2], "pending", 1, Some("stub"), now - 3 * backoff)
         .unwrap();
+    db.touch_enrich_attempt(ids[2], now - 3 * backoff).unwrap();
     // A settled capture is never selected.
     db.set_image_embedding_state(ids[1], "skipped", 1, Some("non-JPEG frame"), now)
         .unwrap();
 
-    // The fresh queue paces on the same clock, and the clock is touched by the
-    // *attempt*, not by the image state (a text-only retry must advance it).
-    db.touch_enrich_attempt(ids[1], now).unwrap();
+    // The fresh queue (IsProcessed = 0) paces on the same clock, and that clock
+    // is touched by the *attempt*, not by the image state — a text-only retry
+    // must advance it too.
+    let mut rec = sample_capture(4);
+    rec.image_token = "tok-4".into();
+    let fresh_id = db.insert_capture(&rec).unwrap();
     let fresh = db.captures_pending_enrichment(64, now, backoff).unwrap();
     assert!(
-        !fresh.iter().any(|(id, _, _)| *id == ids[1]),
-        "#2 is inside its attempt backoff"
+        fresh.iter().any(|(id, _, _)| *id == fresh_id),
+        "a never-attempted capture is due immediately"
     );
-    let fresh = db.captures_pending_enrichment(64, now - 2 * backoff, backoff).unwrap();
+    db.touch_enrich_attempt(fresh_id, now).unwrap();
+    let fresh = db.captures_pending_enrichment(64, now, backoff).unwrap();
     assert!(
-        fresh.iter().any(|(id, _, _)| *id == ids[1]),
-        "#2 returns once its attempt backoff elapses: {fresh:?}"
+        !fresh.iter().any(|(id, _, _)| *id == fresh_id),
+        "inside its attempt backoff: {fresh:?}"
+    );
+    let fresh = db
+        .captures_pending_enrichment(64, now + backoff + 1, backoff)
+        .unwrap();
+    assert!(
+        fresh.iter().any(|(id, _, _)| *id == fresh_id),
+        "returns once its attempt backoff elapses: {fresh:?}"
     );
 
     // #1 is inside its backoff window: the other two still get served.
