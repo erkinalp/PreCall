@@ -289,7 +289,7 @@ mod tests {
         green_only[4 * 7 + 1] ^= 0xFF;
         assert_ne!(base, frame_fingerprint(&green_only));
         let mut one_pixel = frame.clone();
-        one_pixel[4 * 1000 + 0] ^= 0x01;
+        one_pixel[4 * 1000] ^= 0x01;
         assert_ne!(base, frame_fingerprint(&one_pixel));
 
         // Order matters: swapping two words must not cancel out.
