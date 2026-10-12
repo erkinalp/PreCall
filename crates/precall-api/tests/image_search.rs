@@ -415,12 +415,14 @@ fn http_embedder(addr: SocketAddr) -> Embedder {
 /// service came back after the retry backoff elapsed".
 fn expire_retry_backoff(fx: &Fixture) {
     let ukg = Ukg::open(&fx.data_root.join(&fx.client).join("ukg.db")).unwrap();
-    ukg.conn()
-        .execute(
-            "UPDATE \"PrecallImageEmbedding\" SET \"UpdatedAt\" = \"UpdatedAt\" - ?",
-            [120 * 10_000_000i64],
-        )
-        .unwrap();
+    for table in ["PrecallEnrichAttempt", "PrecallImageEmbedding"] {
+        ukg.conn()
+            .execute(
+                &format!("UPDATE \"{table}\" SET \"UpdatedAt\" = \"UpdatedAt\" - ?"),
+                [120 * 10_000_000i64],
+            )
+            .unwrap();
+    }
 }
 
 fn processed_count(fx: &Fixture) -> i64 {
@@ -1089,4 +1091,96 @@ async fn an_existing_embedding_gets_its_state_recorded() {
         .expect("the guard must record the state it verified");
     assert_eq!(state, "done");
     assert!(err.is_none());
+}
+
+/// An interrupted rebuild must resume. The label is the "migration finished"
+/// marker, so it is written last: killed after the clear but before the state
+/// reset, the mismatch is still visible and the next pass redoes the work
+/// instead of orphaning the old rows.
+#[tokio::test]
+async fn an_interrupted_rebuild_is_resumed() {
+    let fx = seed();
+    // A store that claims an old space, with rows and 'done' state rows, i.e.
+    // the situation right before the rebuild.
+    let idx = image_index_in_space(&fx, "clip:old@384");
+    for id in [fx.id_a, fx.id_b] {
+        idx.insert(&SemanticIndex::item_id_for_capture(id), None, None, &vec![0.0f32; 384])
+            .unwrap();
+    }
+    drop(idx);
+    let ukg = Ukg::open(&fx.data_root.join(&fx.client).join("ukg.db")).unwrap();
+    for id in [fx.id_a, fx.id_b] {
+        ukg.mark_processed(id).unwrap();
+        let now = precall_proto::time::filetime_now() as i64;
+        ukg.set_image_embedding_state(id, "done", 1, None, now).unwrap();
+    }
+    drop(ukg);
+    // Interrupted right here: the store was cleared, the label was not moved,
+    // and the state rows still say done.
+    image_index_in_space(&fx, "clip:old@384").clear().unwrap();
+
+    let stats = precall_api::enrich::enrich_once(&fx.data_root, &Embedder::Local, 384, fx.key)
+        .await
+        .unwrap();
+    assert_eq!(stats.image_embeddings, 2, "the rebuild must resume: {stats:?}");
+    let idx = image_index(&fx);
+    assert_eq!(idx.count().unwrap(), 2);
+    assert_eq!(idx.space_id().unwrap().as_deref(), Some(precall_api::LOCAL_IMAGE_SPACE));
+}
+
+/// A capture whose image leg is done while its text leg keeps failing must
+/// still advance the queue clock — otherwise it is selected on every poll and
+/// starves the rest of the queue.
+#[tokio::test]
+async fn a_text_only_retry_still_advances_the_queue_clock() {
+    let fx = seed();
+    // Image embeddings work; the text endpoint is broken.
+    #[derive(Clone)]
+    struct S;
+    async fn health_ok() -> axum::Json<serde_json::Value> {
+        axum::Json(serde_json::json!({
+            "status": "ok",
+            "text_space_id": "clip:text@384",
+            "image_space_id": "clip:text@384",
+        }))
+    }
+    async fn image_ok() -> axum::Json<serde_json::Value> {
+        let mut v = vec![0.0f32; 384];
+        v[0] = 1.0;
+        axum::Json(serde_json::json!({ "embedding": v, "space": "clip:text@384" }))
+    }
+    async fn text_broken() -> (axum::http::StatusCode, &'static str) {
+        (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "text model loading")
+    }
+    let app = axum::Router::new()
+        .route("/health", axum::routing::get(health_ok))
+        .route("/embed/image", post(image_ok))
+        .route("/embed/text", post(text_broken))
+        .with_state(S);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await });
+
+    let first = precall_api::enrich::enrich_once(&fx.data_root, &http_embedder(addr), 384, fx.key)
+        .await
+        .unwrap();
+    assert_eq!(first.image_embeddings, 2, "{first:?}");
+    assert_eq!(first.texts_pending, 2, "the text leg is the stuck one: {first:?}");
+    assert_eq!(processed_count(&fx), 2, "a pending text leg keeps them queued");
+
+    // Every attempt moves the clock, so the very next pass is quiet instead of
+    // re-attempting the same two captures forever.
+    let second = precall_api::enrich::enrich_once(&fx.data_root, &http_embedder(addr), 384, fx.key)
+        .await
+        .unwrap();
+    assert_eq!(second.texts_pending, 0, "paced: {second:?}");
+    assert_eq!(second.image_embeddings, 0, "paced: {second:?}");
+
+    // When the text model finishes loading, the work still happens.
+    expire_retry_backoff(&fx);
+    let third = precall_api::enrich::enrich_once(&fx.data_root, &Embedder::Local, 384, fx.key)
+        .await
+        .unwrap();
+    assert_eq!(third.text_embeddings, 2, "{third:?}");
+    assert_eq!(processed_count(&fx), 0);
 }

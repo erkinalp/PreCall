@@ -223,6 +223,8 @@ async fn enrich_client(
         // `spawn_enricher` stops compiling.
         let mut stop_images = false;
         for (wc_id, ts, token) in backfill {
+            // The clock both queues pace against, whichever leg is stuck.
+            ukg.touch_enrich_attempt(wc_id, now)?;
             let step = image_step(
                 &ukg, &image_index, &objects, &client, wc_id, ts, &token, &mut stats,
             )?;
@@ -245,6 +247,7 @@ async fn enrich_client(
 
         // --- Queue 2: fresh captures (text + image legs) --------------------
         for (wc_id, ts, image_token) in fresh {
+            ukg.touch_enrich_attempt(wc_id, now)?;
             let item = SemanticIndex::item_id_for_capture(wc_id);
 
             // --- text leg: OCR regions → SemanticTextStore -----------------
@@ -258,11 +261,14 @@ async fn enrich_client(
             if !text.is_empty() && !text_index.has_item(&item)? {
                 match embedder.embed_text(&text).await {
                     EmbedOutcome::Ok { embedding: emb, space } => {
-                        if ensure_space(&text_index, &space)? {
-                            // The stored rows belonged to another embedder.
+                        if space_mismatch(&text_index, &space)? {
+                            // The stored rows belonged to another embedder:
+                            // clear, requeue, then move the label last.
+                            text_index.clear()?;
                             ukg.mark_all_unprocessed()?;
                             warn!(client, "text store held another embedding space; rebuilt it");
                         }
+                        text_index.set_space_id(&space)?;
                         text_index.insert(&item, None, None, &emb)?;
                         stats.text_embeddings += 1;
                     }
@@ -325,22 +331,18 @@ async fn enrich_client(
     }
 }
 
-/// Make `idx` the store for `space`, clearing it first when it holds another
-/// space's vectors. Returns `true` when a rebuild happened.
+/// Does `idx` hold vectors from a different space than `space`?
 ///
 /// The per-pass `/health` check cannot be the only guard: `/health` can fail
 /// while `/embed/image` succeeds moments later (the service recovered, or was
 /// rolled forward), and inserting that vector into a store stamped with the
 /// previous space and then relabelling it would leave a permanently mixed,
 /// incomparable index that every later query accepts.
-fn ensure_space(idx: &SemanticIndex, space: &str) -> anyhow::Result<bool> {
-    let stored = idx.space_id()?;
-    let rebuilt = matches!(stored.as_deref(), Some(s) if s != space && s != precall_store::SPACE_UNKNOWN);
-    if rebuilt {
-        idx.clear()?;
-    }
-    idx.set_space_id(space)?;
-    Ok(rebuilt)
+fn space_mismatch(idx: &SemanticIndex, space: &str) -> anyhow::Result<bool> {
+    Ok(matches!(
+        idx.space_id()?.as_deref(),
+        Some(s) if s != space && s != precall_store::SPACE_UNKNOWN
+    ))
 }
 
 /// What to do with one capture's image leg, decided without any `await`.
@@ -477,12 +479,17 @@ fn image_record(
     let now = precall_proto::time::filetime_now() as i64;
     match outcome {
         EmbedOutcome::Ok { embedding, space } => {
-            if ensure_space(image_index, &space)? {
-                // Every row in there came from the previous embedder; the
-                // captures that produced them must be queued again.
+            if space_mismatch(image_index, &space)? {
+                // Every row in there came from the previous embedder. Clear,
+                // requeue, and only then move the label: the label is the
+                // "migration finished" marker, so an interruption before the
+                // last step leaves the mismatch detectable and the repair is
+                // retried instead of silently orphaning the old vectors.
+                image_index.clear()?;
                 ukg.reset_image_embedding_states()?;
                 warn!(client, wc_id, "image store held another embedding space; rebuilt it");
             }
+            image_index.set_space_id(&space)?;
             let item = SemanticIndex::item_id_for_capture(wc_id);
             image_index.insert(&item, None, None, &embedding)?;
             ukg.set_image_embedding_state(wc_id, "done", attempts + 1, None, now)?;

@@ -639,11 +639,12 @@ impl Ukg {
             "SELECT w.\"Id\", w.\"TimeStamp\", w.\"ImageToken\"
              FROM \"WindowCapture\" w
              LEFT JOIN \"PrecallImageEmbedding\" e ON e.\"WindowCaptureId\" = w.\"Id\"
+             LEFT JOIN \"PrecallEnrichAttempt\" a ON a.\"WindowCaptureId\" = w.\"Id\"
              WHERE w.\"ImageToken\" IS NOT NULL
                AND w.\"IsProcessed\" = 1
                AND (e.\"State\" IS NULL OR e.\"State\" = 'pending')
-               AND (e.\"UpdatedAt\" IS NULL OR e.\"UpdatedAt\" <= ?)
-             ORDER BY COALESCE(e.\"UpdatedAt\", 0) ASC, w.\"Id\" ASC
+               AND (a.\"UpdatedAt\" IS NULL OR a.\"UpdatedAt\" <= ?)
+             ORDER BY COALESCE(a.\"UpdatedAt\", 0) ASC, w.\"Id\" ASC
              LIMIT ?",
         )?;
         let rows = stmt.query_map(params![now - backoff, limit], |r| {
@@ -669,10 +670,10 @@ impl Ukg {
         let mut stmt = self.conn.prepare(
             "SELECT w.\"Id\", w.\"TimeStamp\", w.\"ImageToken\"
              FROM \"WindowCapture\" w
-             LEFT JOIN \"PrecallImageEmbedding\" e ON e.\"WindowCaptureId\" = w.\"Id\"
+             LEFT JOIN \"PrecallEnrichAttempt\" a ON a.\"WindowCaptureId\" = w.\"Id\"
              WHERE w.\"IsProcessed\" = 0
-               AND (e.\"UpdatedAt\" IS NULL OR e.\"UpdatedAt\" <= ?)
-             ORDER BY COALESCE(e.\"UpdatedAt\", 0) ASC, w.\"Id\" ASC
+               AND (a.\"UpdatedAt\" IS NULL OR a.\"UpdatedAt\" <= ?)
+             ORDER BY COALESCE(a.\"UpdatedAt\", 0) ASC, w.\"Id\" ASC
              LIMIT ?",
         )?;
         let rows = stmt.query_map(params![now - backoff, limit], |r| {
@@ -682,9 +683,12 @@ impl Ukg {
     }
 
     /// Forget every image-embedding verdict, so the next pass rebuilds the
-    /// image index (used when the embedding space changes).
+    /// image index (used when the embedding space changes). Pacing rows go too:
+    /// an explicit rebuild must not be paced out by the attempt that triggered
+    /// it.
     pub fn reset_image_embedding_states(&self) -> Result<(), UkgError> {
         self.conn.execute("DELETE FROM \"PrecallImageEmbedding\"", [])?;
+        self.conn.execute("DELETE FROM \"PrecallEnrichAttempt\"", [])?;
         Ok(())
     }
 
@@ -693,6 +697,18 @@ impl Ukg {
     pub fn mark_all_unprocessed(&self) -> Result<(), UkgError> {
         self.conn
             .execute("UPDATE \"WindowCapture\" SET \"IsProcessed\" = 0", [])?;
+        self.conn.execute("DELETE FROM \"PrecallEnrichAttempt\"", [])?;
+        Ok(())
+    }
+
+    /// Record that this capture was attempted now, whichever leg — the clock
+    /// both queues pace themselves against.
+    pub fn touch_enrich_attempt(&self, wc_id: i64, now: i64) -> Result<(), UkgError> {
+        self.conn.execute(
+            "INSERT INTO \"PrecallEnrichAttempt\" (\"WindowCaptureId\",\"UpdatedAt\") VALUES (?,?)
+             ON CONFLICT(\"WindowCaptureId\") DO UPDATE SET \"UpdatedAt\" = excluded.\"UpdatedAt\"",
+            params![wc_id, now],
+        )?;
         Ok(())
     }
 
@@ -709,7 +725,8 @@ impl Ukg {
              DELETE FROM \"AppDwellTime\";
              DELETE FROM \"WebDomainDwellTime\";
              DELETE FROM \"PrecallSyncState\";
-             DELETE FROM \"PrecallImageEmbedding\";",
+             DELETE FROM \"PrecallImageEmbedding\";
+             DELETE FROM \"PrecallEnrichAttempt\";",
         )?;
         Ok(())
     }

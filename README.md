@@ -108,7 +108,10 @@ was down is **retried** rather than lost. Per-capture state lives in
 `PrecallImageEmbedding` (`pending`/`done`/`skipped`); `skipped` records why
 (no timestamp, non-JPEG frame, refused input) and is never retried. **Both**
 queues back off for a minute and are ordered least-recently-attempted first, so
-a handful of stuck captures cannot starve the rest of the backlog. Only
+a handful of stuck captures cannot starve the rest of the backlog. The clock
+they pace against is `PrecallEnrichAttempt` — touched by *every* attempt,
+whichever leg, because a capture whose image leg is done while its text leg
+keeps failing would otherwise never move off the front of the queue. Only
 input-specific statuses (400/413/415/422) are terminal: 408/429, 5xx, transport
 failures and even 401/404 are retried, because those clear when the deployment
 is fixed. A read that fails is isolated to its own capture — one corrupt

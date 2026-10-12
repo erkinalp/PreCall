@@ -256,6 +256,20 @@ fn image_backfill_queue_rotates_and_backs_off() {
     db.set_image_embedding_state(ids[1], "skipped", 1, Some("non-JPEG frame"), now)
         .unwrap();
 
+    // The fresh queue paces on the same clock, and the clock is touched by the
+    // *attempt*, not by the image state (a text-only retry must advance it).
+    db.touch_enrich_attempt(ids[1], now).unwrap();
+    let fresh = db.captures_pending_enrichment(64, now, backoff).unwrap();
+    assert!(
+        !fresh.iter().any(|(id, _, _)| *id == ids[1]),
+        "#2 is inside its attempt backoff"
+    );
+    let fresh = db.captures_pending_enrichment(64, now - 2 * backoff, backoff).unwrap();
+    assert!(
+        fresh.iter().any(|(id, _, _)| *id == ids[1]),
+        "#2 returns once its attempt backoff elapses: {fresh:?}"
+    );
+
     // #1 is inside its backoff window: the other two still get served.
     let queued: Vec<i64> = db
         .captures_needing_image_embedding(64, now, backoff)
