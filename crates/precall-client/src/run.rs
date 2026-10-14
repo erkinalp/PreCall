@@ -110,12 +110,6 @@ pub async fn run(cfg: ClientConfig, mut stop: watch::Receiver<bool>) -> Result<(
     // It must outlive connections: the slot does, and resetting it would re-add
     // every historical overwrite to the next heartbeat.
     let mut slot_drops_reported = 0u64;
-    // Generation of the duplicator the surface was built from, and the size the
-    // broker was told about. A display mode change re-creates the duplicator, and
-    // the broker's surface must be rebuilt at the new size.
-    let mut last_generation = 0u64;
-    let mut advertised: (u32, u32) = (0, 0);
-
     loop {
         if *stop.borrow() {
             break;
@@ -129,7 +123,6 @@ pub async fn run(cfg: ClientConfig, mut stop: watch::Receiver<bool>) -> Result<(
             frames = new_frames;
             geometry = new_geometry;
             frame_chan = frame_bridge(&frames);
-            last_generation = 0;
             // The new slot's drop counter starts at zero: keeping the old
             // baseline would subtract an unrelated count and hide this worker's
             // early drops (hundreds during a reconnect backoff).
@@ -146,8 +139,12 @@ pub async fn run(cfg: ClientConfig, mut stop: watch::Receiver<bool>) -> Result<(
         } else {
             crate::dxgi::primary_output_size().unwrap_or((0, 0))
         };
-        advertised = display;
-        last_generation = capture_geometry.generation;
+        // Both live for the life of this connection: the surface geometry the
+        // broker was told about, and the duplicator generation it was built from.
+        // A display mode change re-creates the duplicator, so the broker's
+        // surface must be rebuilt at the new size.
+        let advertised = display;
+        let mut last_generation = capture_geometry.generation;
         let conn = match Connection::connect(&cfg, display).await {
             Ok(c) => {
                 backoff = std::time::Duration::from_millis(500);
