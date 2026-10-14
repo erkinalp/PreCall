@@ -4,7 +4,7 @@
 //! are !Send); frames go out over a std::mpsc channel.
 
 use crate::ClientError;
-use precall_frame::LatestSlot;
+use precall_frame::ChangeSlot;
 use std::sync::Arc;
 use windows::core::Interface;
 use windows::Win32::Graphics::Direct3D11::{
@@ -22,6 +22,16 @@ use windows::Win32::Graphics::Dxgi::{
     DXGI_OUTDUPL_MOVE_RECT,
 };
 use windows::Win32::Graphics::Direct3D::{D3D_DRIVER_TYPE_HARDWARE, D3D_FEATURE_LEVEL_11_0};
+
+/// The change metadata of a captured frame, as [`ChangeSlot`] needs it.
+///
+/// Taking it out of the frame means a pending set can never be double-counted,
+/// and an unreadable read (`None`) propagates as "send the whole frame".
+impl precall_frame::ChangeMeta for CaptureFrame {
+    fn take_changes(&mut self) -> (Option<Vec<precall_frame::Rect>>, bool) {
+        (self.dirty.take(), std::mem::replace(&mut self.moved, false))
+    }
+}
 
 /// `sizeof(RECT)` on the wire — the metadata buffers are arrays of these.
 const RECT_SIZE: usize = std::mem::size_of::<RECT>();
@@ -260,18 +270,18 @@ pub fn primary_output_size() -> Result<(u32, u32), ClientError> {
 
 /// Spawn the capture thread.
 ///
-/// Frames go into a [`LatestSlot`], **not** a queue: at 1920x1080x60 the display
+/// Frames go into a [`ChangeSlot`], **not** a queue: at 1920x1080x60 the display
 /// produces ~480 MB/s of BGRA, so an unbounded handoff grows without limit and
 /// the stream shows a desktop from minutes ago. The slot holds one frame and
 /// overwrites it, which is how a real-time agent drops frames; the send loop
-/// reads [`LatestSlot::dropped`] into the heartbeat so link pressure is visible.
+/// reads [`ChangeSlot::dropped`] into the heartbeat so link pressure is visible.
 ///
 /// `on_error` is called once if duplication cannot be (re)established.
 pub fn spawn_capture(
     output_index: u32,
     on_error: impl Fn(ClientError) + Send + 'static,
-) -> Arc<LatestSlot<CaptureFrame>> {
-    let slot = Arc::new(LatestSlot::new());
+) -> Arc<ChangeSlot<CaptureFrame>> {
+    let slot = Arc::new(ChangeSlot::new());
     let producer = Arc::clone(&slot);
     std::thread::Builder::new()
         .name("precall-dxgi".into())

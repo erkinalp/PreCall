@@ -74,17 +74,31 @@ impl<T> LatestSlot<T> {
     /// Publish a frame, replacing (and counting) any frame the consumer has not
     /// taken yet.
     pub fn publish(&self, frame: T) {
+        let _ = self.publish_swap(frame);
+    }
+
+    /// Publish a frame, returning the frame it displaced.
+    ///
+    /// The displaced frame is *gone* from the slot, so a caller whose frames
+    /// carry change metadata ([`ChangeSlot`]) must fold that metadata into the
+    /// next handoff instead of letting it vanish.
+    pub fn publish_swap(&self, frame: T) -> Option<T> {
         if self.is_closed() {
-            return;
+            return None;
         }
-        let mut slot = self.slot.lock().unwrap();
-        if slot.is_some() {
-            self.dropped.fetch_add(1, Ordering::Relaxed);
-        } else {
+        let displaced = {
+            let mut slot = self.slot.lock().unwrap();
+            let displaced = slot.replace(frame);
+            if displaced.is_some() {
+                self.dropped.fetch_add(1, Ordering::Relaxed);
+            }
+            displaced
+        };
+        if displaced.is_none() && !self.is_closed() {
             self.ready.notify_one();
         }
-        *slot = Some(frame);
         self.published.fetch_add(1, Ordering::Relaxed);
+        displaced
     }
 
     /// Block until a frame is available, then take it.
@@ -124,6 +138,112 @@ impl<T> LatestSlot<T> {
 /// Mixing constant for the word-wise fingerprint (golden ratio / xxHash prime).
 const MIX_A: u64 = 0x9E37_79B9_7F4A_7C15;
 const MIX_B: u64 = 0xBF58_476D_1CE4_E5B9;
+
+/// The change metadata a captured frame carries, taken out of it on the way to
+/// the sender.
+///
+/// `None` means the platform could not report changes for that frame: the
+/// caller must treat it as "send the whole frame", never as "nothing changed".
+pub trait ChangeMeta {
+    fn take_changes(&mut self) -> (Option<Vec<Rect>>, bool);
+}
+
+/// A one-frame handoff that does **not** lose change metadata.
+///
+/// [`LatestSlot`] keeps one frame: while the sender is encoding or the link is
+/// slow — routine at a 16 ms cadence — the producer overwrites the resident
+/// frame and it is gone. Every dirty list DXGI reports is relative to the
+/// previous *acquired* frame, so a frame lost this way leaves the broker's
+/// desktop surface stale exactly where it changed. `ChangeSlot` folds the
+/// displaced frame's rectangles (and its scroll flag) into the metadata handed
+/// out with the next frame, and merges overlaps, so arbitrary backpressure still
+/// yields a bounded delta.
+///
+/// Ordering note: the displaced frame's metadata is inserted outside the slot's
+/// lock, so a concurrent [`ChangeSlot::recv`] can drain just before it lands.
+/// That is safe by construction — rectangles are applied as slices of the
+/// *newest* frame's pixels, so a delayed rectangle is repainted correctly one
+/// handoff later. It can be delayed, never lost.
+pub struct ChangeSlot<T: ChangeMeta> {
+    slot: LatestSlot<T>,
+    pending: Mutex<(Option<Vec<Rect>>, bool)>,
+}
+
+impl<T: ChangeMeta> Default for ChangeSlot<T> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// `Some` only if both sides have usable metadata.
+fn combine(a: Option<Vec<Rect>>, b: Option<Vec<Rect>>) -> Option<Vec<Rect>> {
+    match (a, b) {
+        (Some(mut a), Some(b)) => {
+            a.extend(b);
+            Some(a)
+        }
+        _ => None,
+    }
+}
+
+impl<T: ChangeMeta> ChangeSlot<T> {
+    pub fn new() -> Self {
+        Self {
+            slot: LatestSlot::new(),
+            pending: Mutex::new((Some(Vec::new()), false)),
+        }
+    }
+
+    /// Publish a frame, retaining the change metadata of any frame it displaces.
+    pub fn publish(&self, frame: T) {
+        if let Some(mut displaced) = self.slot.publish_swap(frame) {
+            let (dirty, moved) = displaced.take_changes();
+            let mut pending = self.pending.lock().unwrap();
+            pending.0 = combine(pending.0.take(), dirty);
+            pending.1 |= moved;
+        }
+    }
+
+    /// Take the newest frame together with every change reported since the last
+    /// successful handoff, overlaps merged.
+    pub fn recv(&self) -> Option<(T, Option<Vec<Rect>>, bool)> {
+        let frame = self.slot.recv()?;
+        Some(self.drain(frame))
+    }
+
+    pub fn try_recv(&self) -> Option<(T, Option<Vec<Rect>>, bool)> {
+        let frame = self.slot.try_recv()?;
+        Some(self.drain(frame))
+    }
+
+    fn drain(&self, mut frame: T) -> (T, Option<Vec<Rect>>, bool) {
+        let (dirty, moved) = frame.take_changes();
+        let (pending, pending_moved) = {
+            let mut guard = self.pending.lock().unwrap();
+            // Reset to "nothing outstanding" — `take()` would leave `None`,
+            // which the union reads as "metadata was unreadable".
+            (guard.0.replace(Vec::new()), std::mem::replace(&mut guard.1, false))
+        };
+        let merged = combine(pending, dirty).map(|rects| merge_rects(&rects));
+        (frame, merged, moved || pending_moved)
+    }
+
+    pub fn close(&self) {
+        self.slot.close();
+    }
+
+    pub fn is_closed(&self) -> bool {
+        self.slot.is_closed()
+    }
+
+    pub fn published(&self) -> u64 {
+        self.slot.published()
+    }
+
+    pub fn dropped(&self) -> u64 {
+        self.slot.dropped()
+    }
+}
 
 /// Fingerprint a BGRA frame **exactly**: every byte participates.
 ///
@@ -636,5 +756,92 @@ mod merge_tests {
             matches!(plan, CapturePlan::Regions(_)),
             "still sendable as a delta: {plan:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod change_slot_tests {
+    use super::*;
+
+    #[derive(Debug)]
+    struct TestFrame {
+        id: u32,
+        dirty: Option<Vec<Rect>>,
+        moved: bool,
+    }
+
+    impl ChangeMeta for TestFrame {
+        fn take_changes(&mut self) -> (Option<Vec<Rect>>, bool) {
+            (self.dirty.take(), std::mem::replace(&mut self.moved, false))
+        }
+    }
+
+    fn frame(id: u32, dirty: &[Rect]) -> TestFrame {
+        TestFrame { id, dirty: Some(dirty.to_vec()), moved: false }
+    }
+
+    /// The bug this exists for: a frame overwritten in the slot loses its
+    /// rectangles, and every DXGI list is relative to the previous acquired
+    /// frame, so those pixels never reach the broker's surface.
+    #[test]
+    fn a_displaced_frame_still_contributes_its_rectangles() {
+        let slot = ChangeSlot::new();
+        let far = Rect::new(1700, 900, 1800, 1000);
+        slot.publish(frame(1, &[far]));
+        // Overwritten before anyone took it.
+        for i in 2..50 {
+            slot.publish(frame(i, &[Rect::new(0, 0, 4, 4)]));
+        }
+        let (newest, dirty, moved) = slot.recv().unwrap();
+        assert_eq!(newest.id, 49, "the newest frame is handed out");
+        let dirty = dirty.expect("metadata was readable");
+        assert!(
+            dirty.iter().any(|r| r.left <= far.left && r.right >= far.right
+                && r.top <= far.top && r.bottom >= far.bottom),
+            "the displaced frame's rectangle survives: {dirty:?}"
+        );
+        assert!(!moved);
+        // Bounded: 49 frames of changes collapsed to a couple of rectangles.
+        assert!(dirty.len() <= 2, "accumulation stays a delta: {dirty:?}");
+    }
+
+    #[test]
+    fn a_displaced_scroll_forces_a_keyframe() {
+        let slot = ChangeSlot::new();
+        let mut scrolled = frame(1, &[Rect::new(0, 400, 1920, 460)]);
+        scrolled.moved = true;
+        slot.publish(scrolled);
+        slot.publish(frame(2, &[Rect::new(10, 10, 20, 20)]));
+        let (_, dirty, moved) = slot.recv().unwrap();
+        assert!(moved, "the scroll flag survives the overwrite");
+        assert!(dirty.is_some());
+    }
+
+    #[test]
+    fn unreadable_metadata_dominates_the_union() {
+        let slot = ChangeSlot::new();
+        slot.publish(TestFrame { id: 1, dirty: None, moved: false });
+        slot.publish(frame(2, &[Rect::new(1, 1, 2, 2)]));
+        let (_, dirty, _) = slot.recv().unwrap();
+        assert!(
+            dirty.is_none(),
+            "one unreadable frame means the caller must send a whole frame"
+        );
+    }
+
+    #[test]
+    fn a_taken_frame_leaves_nothing_pending() {
+        let slot = ChangeSlot::new();
+        slot.publish(frame(1, &[Rect::new(0, 0, 8, 8)]));
+        let (_, first, _) = slot.recv().unwrap();
+        assert_eq!(first.unwrap().len(), 1);
+        // Nothing published since: the next recv blocks, so use try_recv.
+        assert!(slot.try_recv().is_none());
+        slot.publish(frame(2, &[]));
+        let (_, second, moved) = slot.recv().unwrap();
+        assert!(second.unwrap().is_empty(), "no stale rectangles linger");
+        assert!(!moved);
+        assert_eq!(slot.published(), 2);
+        assert_eq!(slot.dropped(), 0);
     }
 }

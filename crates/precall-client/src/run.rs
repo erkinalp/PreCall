@@ -101,6 +101,10 @@ pub async fn run(cfg: ClientConfig, mut stop: watch::Receiver<bool>) -> Result<(
     let mut backoff = std::time::Duration::from_millis(500);
     let mut counters = Counters::default();
     let mut last_hash = 0u64;
+    // How much of the slot's cumulative drop counter has already been reported.
+    // It must outlive connections: the slot does, and resetting it would re-add
+    // every historical overwrite to the next heartbeat.
+    let mut slot_drops_reported = 0u64;
 
     loop {
         if *stop.borrow() {
@@ -144,16 +148,19 @@ pub async fn run(cfg: ClientConfig, mut stop: watch::Receiver<bool>) -> Result<(
         ));
         let mut hb_tick =
             tokio::time::interval(std::time::Duration::from_millis(conn.hello.heartbeat_interval_ms.max(5000) as u64));
-        let mut latest_frame: Option<crate::dxgi::CaptureFrame> = None;
-        // Dirty rectangles of frames discarded since the last capture we sent.
-        // DXGI reports changes relative to the previous *acquired* frame, so
-        // dropping these would apply only the newest change to the server's
-        // surface and archive screenshots that are stale everywhere else.
-        let mut pending_dirty: Vec<precall_frame::Rect> = Vec::new();
+        let mut latest_frame: Option<BridgedFrame> = None;
+        // Changes reported since the last capture we sent. DXGI reports them
+        // relative to the previous *acquired* frame, so dropping any would apply
+        // only the newest change to the server's surface and archive stale
+        // screenshots. `None` means some frame's metadata was unreadable, which
+        // forces a keyframe rather than quietly sending a partial delta.
+        let mut pending_dirty: Option<Vec<precall_frame::Rect>> = Some(Vec::new());
+        // A scroll seen since the last send: the wire has no surface-copy
+        // operation, so the next frame goes whole.
+        let mut pending_moved = false;
         // A keyframe first: the server has no surface for this connection, and
         // a reconnected client's surface died with its session.
         let mut force_keyframe = true;
-        let mut slot_drops_reported = 0u64;
         let mut pending: std::collections::VecDeque<u64> = std::collections::VecDeque::new();
 
         loop {
@@ -163,23 +170,13 @@ pub async fn run(cfg: ClientConfig, mut stop: watch::Receiver<bool>) -> Result<(
                     match f {
                         Some(fr) => {
                             if let Some(prev) = latest_frame.replace(fr) {
-                                // The replaced frame is discarded, so its dirty
-                                // list must be merged into the next delta (each
-                                // list describes changes since the *previous
-                                // acquired* frame) and counted, or the heartbeat
-                                // claims the pipeline is keeping up while frames
-                                // are being thrown away.
-                                if let Some(d) = prev.dirty {
-                                    pending_dirty.extend(d);
-                                }
+                                absorb(&mut pending_dirty, &mut pending_moved, prev);
                                 counters.frames_dropped += 1;
                             }
                             // Newest-only: anything already queued is older.
                             while let Ok(fr) = frame_chan.try_recv() {
                                 if let Some(prev) = latest_frame.replace(fr) {
-                                    if let Some(d) = prev.dirty {
-                                        pending_dirty.extend(d);
-                                    }
+                                    absorb(&mut pending_dirty, &mut pending_moved, prev);
                                     counters.frames_dropped += 1;
                                 }
                             }
@@ -196,7 +193,10 @@ pub async fn run(cfg: ClientConfig, mut stop: watch::Receiver<bool>) -> Result<(
                     }
                 }
                 _ = capture_tick.tick() => {
-                    let Some(frame) = latest_frame.take() else { continue };
+                    let Some((frame, frame_dirty, frame_moved)) = latest_frame.take() else {
+                        continue;
+                    };
+                    absorb_meta(&mut pending_dirty, &mut pending_moved, frame_dirty, frame_moved);
                     // When DXGI gives us dirty rectangles they are the
                     // authoritative change signal (and an empty list means the
                     // desktop did not change), so the 1.18 ms fingerprint is
@@ -204,7 +204,7 @@ pub async fn run(cfg: ClientConfig, mut stop: watch::Receiver<bool>) -> Result<(
                     // metadata is unavailable: DXGI redelivers an identical
                     // desktop around mode changes, and a moved pointer changes
                     // metadata but no pixels.
-                    if frame.dirty.is_none() {
+                    if pending_dirty.is_none() {
                         let hash = precall_frame::frame_fingerprint(&frame.bgra);
                         if hash == last_hash {
                             counters.frames_skipped_unchanged += 1;
@@ -219,20 +219,15 @@ pub async fn run(cfg: ClientConfig, mut stop: watch::Receiver<bool>) -> Result<(
                     // It runs on the blocking pool: on the reactor it would
                     // stall this loop, and the whole point of the cadence is
                     // that the *next* capture is decided on time.
-                    // What to send for this frame. The policy is pure and
-                    // tested (`precall_frame::plan_capture`); unreadable
-                    // metadata and scrolled frames force a keyframe, a fresh
-                    // connection always starts with one (the server has no
-                    // surface for this session yet).
-                    // Everything that changed since the last *sent* capture:
-                    // the discarded frames' dirty rectangles plus this frame's.
-                    if let Some(d) = &frame.dirty {
-                        pending_dirty.extend(d.iter().copied());
-                    }
-                    let merged = precall_frame::merge_rects(&pending_dirty);
-                    let plan = match (&frame.dirty, frame.moved) {
-                        (Some(_), false) if !force_keyframe => precall_frame::plan_capture(
-                            &merged,
+                    // Everything that changed since the last *sent* capture.
+                    // The policy is pure and tested
+                    // (`precall_frame::plan_capture`): unreadable metadata,
+                    // accumulated scrolls and a fresh connection all force a
+                    // keyframe; past half a screen's worth of change a keyframe
+                    // is cheaper than the per-rectangle overhead.
+                    let plan = match (&pending_dirty, pending_moved) {
+                        (Some(dirty), false) if !force_keyframe => precall_frame::plan_capture(
+                            dirty,
                             false,
                             (frame.width as i64) * (frame.height as i64),
                             false,
@@ -314,16 +309,27 @@ pub async fn run(cfg: ClientConfig, mut stop: watch::Receiver<bool>) -> Result<(
                         Ok(Ok(Prepared::Frame(f))) => *f,
                         Ok(Ok(Prepared::Dropped)) => {
                             counters.frames_skipped_privacy += 1;
+                            // Keep accumulating: these pixels were never sent,
+                            // so the surface still needs them. Bounding is what
+                            // stops a long pause or an excluded app from growing
+                            // the set without limit; over budget the next frame
+                            // is a keyframe instead.
+                            bound_pending(&mut pending_dirty);
                             continue;
                         }
                         // No foreground window is the ordinary case, not a drop.
-                        Ok(Ok(Prepared::NoWindow)) => continue,
+                        Ok(Ok(Prepared::NoWindow)) => {
+                            bound_pending(&mut pending_dirty);
+                            continue;
+                        }
                         Ok(Err(e)) => {
                             tracing::warn!("jpeg: {e}");
+                            bound_pending(&mut pending_dirty);
                             continue;
                         }
                         Err(e) => {
                             tracing::warn!("capture preparation panicked: {e}");
+                            bound_pending(&mut pending_dirty);
                             continue;
                         }
                     };
@@ -368,7 +374,8 @@ pub async fn run(cfg: ClientConfig, mut stop: watch::Receiver<bool>) -> Result<(
                     counters.frames_sent += 1;
                     // The surface is current as of this capture; from here the
                     // server holds a surface for this session.
-                    pending_dirty.clear();
+                    pending_dirty = Some(Vec::new());
+                    pending_moved = false;
                     force_keyframe = false;
                 }
                 _ = hb_tick.tick() => {
@@ -419,9 +426,58 @@ pub async fn run(cfg: ClientConfig, mut stop: watch::Receiver<bool>) -> Result<(
 ///
 /// The returned receiver yields `None` exactly when the capture worker closes
 /// the slot, which is the signal that the loop must abandon this session.
+/// Fold a discarded frame's change metadata into the pending set.
+fn absorb(
+    pending: &mut Option<Vec<precall_frame::Rect>>,
+    moved: &mut bool,
+    (_, dirty, frame_moved): BridgedFrame,
+) {
+    absorb_meta(pending, moved, dirty, frame_moved);
+}
+
+fn absorb_meta(
+    pending: &mut Option<Vec<precall_frame::Rect>>,
+    moved: &mut bool,
+    dirty: Option<Vec<precall_frame::Rect>>,
+    frame_moved: bool,
+) {
+    match (pending.as_mut(), dirty) {
+        // Unreadable metadata on any frame makes the whole union unknown.
+        (_, None) => *pending = None,
+        (Some(acc), Some(rects)) => {
+            acc.extend(rects);
+            *acc = precall_frame::merge_rects(acc);
+        }
+        (None, Some(_)) => {}
+    }
+    *moved |= frame_moved;
+}
+
+/// Keep an accumulating delta bounded: past the per-capture rectangle budget the
+/// next frame is a keyframe, which is both correct and what a long pause wants.
+fn bound_pending(pending: &mut Option<Vec<precall_frame::Rect>>) {
+    if let Some(rects) = pending.as_mut() {
+        *rects = precall_frame::merge_rects(rects);
+        if rects.len() > precall_frame::MAX_DIRTY_RECTS {
+            *pending = None;
+        }
+    }
+}
+
+/// One captured frame plus every change reported since the last one handed out.
+///
+/// The handoff itself ([`precall_frame::ChangeSlot`]) folds in the metadata of
+/// frames it overwrote; the bridge adds nothing, it just carries it, so the
+/// send loop's own accumulation only has to cover what *it* discards.
+type BridgedFrame = (
+    crate::dxgi::CaptureFrame,
+    Option<Vec<precall_frame::Rect>>,
+    bool,
+);
+
 fn frame_bridge(
-    frames: &std::sync::Arc<precall_frame::LatestSlot<crate::dxgi::CaptureFrame>>,
-) -> tokio::sync::mpsc::Receiver<crate::dxgi::CaptureFrame> {
+    frames: &std::sync::Arc<precall_frame::ChangeSlot<crate::dxgi::CaptureFrame>>,
+) -> tokio::sync::mpsc::Receiver<BridgedFrame> {
     let (tx, rx) = tokio::sync::mpsc::channel(2);
     let slot = std::sync::Arc::clone(frames);
     tokio::task::spawn_blocking(move || loop {
