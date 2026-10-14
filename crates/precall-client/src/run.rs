@@ -117,6 +117,10 @@ pub async fn run(cfg: ClientConfig, mut stop: watch::Receiver<bool>) -> Result<(
             tracing::warn!("capture worker gone; restarting it");
             frames = spawn_capture(0, |e| tracing::warn!("capture thread: {e}"));
             frame_chan = frame_bridge(&frames);
+            // The new slot's drop counter starts at zero: keeping the old
+            // baseline would subtract an unrelated count and hide this worker's
+            // early drops (hundreds during a reconnect backoff).
+            slot_drops_reported = 0;
         }
         // The broker composes dirty rectangles against this size, so it must be
         // the real desktop, not zero (which used to make every single-rectangle

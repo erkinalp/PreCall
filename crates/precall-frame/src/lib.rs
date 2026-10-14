@@ -74,31 +74,41 @@ impl<T> LatestSlot<T> {
     /// Publish a frame, replacing (and counting) any frame the consumer has not
     /// taken yet.
     pub fn publish(&self, frame: T) {
-        let _ = self.publish_swap(frame);
+        self.publish_with(frame, |_| {});
     }
 
-    /// Publish a frame, returning the frame it displaced.
+    /// Publish a frame, handing any displaced frame to `on_displaced` **inside
+    /// the critical section**.
     ///
-    /// The displaced frame is *gone* from the slot, so a caller whose frames
-    /// carry change metadata ([`ChangeSlot`]) must fold that metadata into the
-    /// next handoff instead of letting it vanish.
-    pub fn publish_swap(&self, frame: T) -> Option<T> {
+    /// The displaced frame is gone from the slot, so a caller whose frames carry
+    /// change metadata ([`ChangeSlot`]) must fold that metadata into the next
+    /// handoff instead of letting it vanish. The callback runs while the slot
+    /// lock is held, which is what makes the replacement and the metadata
+    /// transfer atomic *from the consumer's perspective*: no consumer can take
+    /// the replacement before the displaced frame's metadata has been recorded,
+    /// so the metadata can never be left waiting for a later frame that may
+    /// never arrive (the desktop's last change, then silence).
+    pub fn publish_with(&self, frame: T, on_displaced: impl FnOnce(T)) {
         if self.is_closed() {
-            return None;
+            return;
         }
-        let displaced = {
-            let mut slot = self.slot.lock().unwrap();
-            let displaced = slot.replace(frame);
-            if displaced.is_some() {
-                self.dropped.fetch_add(1, Ordering::Relaxed);
-            }
-            displaced
-        };
-        if displaced.is_none() && !self.is_closed() {
+        // The callback runs **while the slot lock is held**, so a consumer
+        // cannot take the replacement until the displaced frame has been dealt
+        // with. `on_displaced` must therefore take only locks that a consumer
+        // never holds while holding this one (the `ChangeSlot` accumulator
+        // qualifies: consumers drain it after releasing the slot).
+        let slot = self.slot.lock().unwrap();
+        let mut slot = slot;
+        let displaced = slot.replace(frame);
+        if displaced.is_some() {
+            self.dropped.fetch_add(1, Ordering::Relaxed);
+        } else {
             self.ready.notify_one();
         }
         self.published.fetch_add(1, Ordering::Relaxed);
-        displaced
+        if let Some(displaced) = displaced {
+            on_displaced(displaced);
+        }
     }
 
     /// Block until a frame is available, then take it.
@@ -195,13 +205,28 @@ impl<T: ChangeMeta> ChangeSlot<T> {
     }
 
     /// Publish a frame, retaining the change metadata of any frame it displaces.
+    ///
+    /// Recording happens inside the slot's critical section (see
+    /// [`LatestSlot::publish_with`]), so a displaced frame's rectangles always
+    /// ride with the very next handoff — never waiting for a frame that may
+    /// never come.
     pub fn publish(&self, frame: T) {
-        if let Some(mut displaced) = self.slot.publish_swap(frame) {
+        self.slot.publish_with(frame, |mut displaced| {
             let (dirty, moved) = displaced.take_changes();
             let mut pending = self.pending.lock().unwrap();
             pending.0 = combine(pending.0.take(), dirty);
             pending.1 |= moved;
-        }
+            // Bounded here, where it grows: while the consumer is blocked (a
+            // server outage, a slow link) every overwrite would otherwise append
+            // for the whole outage. Over budget the accumulator becomes
+            // "unknown", which makes the next frame a keyframe.
+            if let Some(rects) = pending.0.as_mut() {
+                *rects = merge_rects(rects);
+                if rects.len() > MAX_DIRTY_RECTS {
+                    pending.0 = None;
+                }
+            }
+        });
     }
 
     /// Take the newest frame together with every change reported since the last
@@ -843,5 +868,98 @@ mod change_slot_tests {
         assert!(!moved);
         assert_eq!(slot.published(), 2);
         assert_eq!(slot.dropped(), 0);
+    }
+}
+
+#[cfg(test)]
+mod change_slot_bound_tests {
+    use super::*;
+    use std::sync::Arc;
+
+    #[derive(Debug)]
+    struct F {
+        dirty: Option<Vec<Rect>>,
+    }
+
+    impl ChangeMeta for F {
+        fn take_changes(&mut self) -> (Option<Vec<Rect>>, bool) {
+            (self.dirty.take(), false)
+        }
+    }
+
+    fn f(dirty: &[Rect]) -> F {
+        F { dirty: Some(dirty.to_vec()) }
+    }
+
+    /// While the consumer is blocked (a server outage, a slow link) every
+    /// overwrite lands in the accumulator — it must not grow for the whole
+    /// outage.
+    #[test]
+    fn metadata_stays_bounded_while_the_consumer_is_blocked() {
+        let slot = ChangeSlot::new();
+        for i in 0..20_000i16 {
+            // A distinct rectangle each time, so merging cannot cheat.
+            slot.publish(f(&[Rect::new(i % 1000, i / 1000, i % 1000 + 3, i / 1000 + 3)]));
+        }
+        let (_, dirty, _) = slot.recv().unwrap();
+        match dirty {
+            // Over budget the accumulator says "unknown", which means keyframe.
+            None => {}
+            Some(rects) => assert!(
+                rects.len() <= MAX_DIRTY_RECTS,
+                "accumulator must stay inside the per-capture budget: {}",
+                rects.len()
+            ),
+        }
+    }
+
+    /// The desktop's last change, then silence: the displaced frame's rectangles
+    /// must ride with the very next take, not wait for a frame that never comes.
+    #[test]
+    fn a_displaced_frame_is_paired_with_the_next_take() {
+        let slot = ChangeSlot::new();
+        let last = Rect::new(900, 700, 950, 750);
+        slot.publish(f(&[last]));
+        slot.publish(f(&[]));
+        let (_, dirty, _) = slot.recv().unwrap();
+        let rects = dirty.expect("metadata readable");
+        assert!(
+            rects.iter().any(|r| r.left <= last.left && r.right >= last.right),
+            "the displaced change came out with the replacement: {rects:?}"
+        );
+        assert!(slot.try_recv().is_none());
+    }
+
+    /// Same guarantee under contention: whatever the interleaving, the first
+    /// frame's change is handed out with a take, never stranded.
+    #[test]
+    fn displaced_metadata_is_never_stranded_under_contention() {
+        for _ in 0..200 {
+            let slot = Arc::new(ChangeSlot::new());
+            let first = Rect::new(10, 10, 20, 20);
+            let producer = {
+                let slot = Arc::clone(&slot);
+                std::thread::spawn(move || {
+                    slot.publish(f(&[first]));
+                    for i in 0..8i16 {
+                        slot.publish(f(&[Rect::new(i, i, i + 2, i + 2)]));
+                    }
+                    slot.close();
+                })
+            };
+            let mut seen_first = false;
+            while let Some((_, dirty, _)) = slot.recv() {
+                if let Some(rects) = dirty {
+                    if rects.iter().any(|r| r.left <= first.left && r.right >= first.right) {
+                        seen_first = true;
+                    }
+                } else {
+                    // An unreadable/over-budget accumulator implies a keyframe.
+                    seen_first = true;
+                }
+            }
+            producer.join().unwrap();
+            assert!(seen_first, "the first frame's change must not be stranded");
+        }
     }
 }
