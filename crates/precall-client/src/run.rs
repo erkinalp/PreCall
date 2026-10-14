@@ -133,12 +133,10 @@ pub async fn run(cfg: ClientConfig, mut stop: watch::Receiver<bool>) -> Result<(
         } else {
             crate::dxgi::primary_output_size().unwrap_or((0, 0))
         };
-        // Both live for the life of this connection: the surface geometry the
-        // broker was told about, and the duplicator generation it was built from.
-        // A display mode change re-creates the duplicator, so the broker's
-        // surface must be rebuilt at the new size.
+        // The geometry the broker is told about for this connection. A display
+        // mode change re-creates the duplicator, so the broker's surface must be
+        // rebuilt at the new size.
         let advertised = display;
-        let mut last_generation = capture_geometry.generation;
         let conn = match Connection::connect(&cfg, display).await {
             Ok(c) => {
                 backoff = std::time::Duration::from_millis(500);
@@ -169,9 +167,11 @@ pub async fn run(cfg: ClientConfig, mut stop: watch::Receiver<bool>) -> Result<(
         // The snapshot above was taken *before* the handshake: the capture thread
         // may have created or re-created the duplicator while it was in flight,
         // in which case the current generation is the newer one and the frames we
-        // just received belong to it. Re-read before deciding what to keep.
+        // just received belong to it. Re-read before deciding what to keep — and
+        // declare the tracker *here*, where its value is authoritative, rather
+        // than before the await only to overwrite it (which is a dead store).
         let capture_geometry = *geometry.lock().unwrap();
-        last_generation = capture_geometry.generation;
+        let mut last_generation = capture_geometry.generation;
         retain_current_generation(&mut latest_frame, &mut frame_chan, last_generation);
         // Fingerprint of the last frame *successfully transmitted* through the
         // metadata-less path, and only for *this* session: the broker's new
