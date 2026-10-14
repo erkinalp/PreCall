@@ -139,10 +139,6 @@ pub async fn run(cfg: ClientConfig, mut stop: watch::Receiver<bool>) -> Result<(
         // surface must be rebuilt at the new size.
         let advertised = display;
         let mut last_generation = capture_geometry.generation;
-        // Frames captured before this handshake describe the previous session
-        // (possibly at a different size); a forced keyframe must not be an old
-        // frame out of the channel.
-        while frame_chan.try_recv().is_ok() {}
         let conn = match Connection::connect(&cfg, display).await {
             Ok(c) => {
                 backoff = std::time::Duration::from_millis(500);
@@ -170,6 +166,18 @@ pub async fn run(cfg: ClientConfig, mut stop: watch::Receiver<bool>) -> Result<(
         let mut hb_tick =
             tokio::time::interval(std::time::Duration::from_millis(conn.hello.heartbeat_interval_ms.max(5000) as u64));
         let mut latest_frame: Option<BridgedFrame> = None;
+        // Frames captured before this handshake may describe a *different*
+        // desktop (the duplicator is re-created on a mode change). Drop those,
+        // but keep the newest one that matches the current generation: DXGI need
+        // not publish another frame while the desktop is static, so discarding
+        // everything could leave this session with nothing to send at all.
+        while let Ok((frame, dirty, moved)) = frame_chan.try_recv() {
+            if frame.generation == capture_geometry.generation {
+                // Newest matching frame wins; earlier matching ones are stale
+                // copies of the same desktop, so their metadata is dropped.
+                latest_frame = Some((frame, dirty, moved));
+            }
+        }
         // Fingerprint of the last frame *successfully transmitted* through the
         // metadata-less path, and only for *this* session: the broker's new
         // session has no surface, so a previous session's hash must never

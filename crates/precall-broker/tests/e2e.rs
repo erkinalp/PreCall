@@ -444,6 +444,7 @@ async fn composing_a_delta_does_not_block_the_runtime_worker() {
     // `worker_threads = 1`. Composition must not appear here.
     let worker_thread = std::thread::current().id();
     precall_broker::COMPOSE_THREADS.lock().unwrap().clear();
+    precall_broker::COMPOSE_RECORDING.store(true, std::sync::atomic::Ordering::Relaxed);
 
     // One delta: this is what triggers the 1080p compose + encode.
     let regions = vec![(Rect::new(100, 100, 300, 200), solid_jpeg(200, 100, [255, 0, 0]))];
@@ -481,6 +482,7 @@ async fn composing_a_delta_does_not_block_the_runtime_worker() {
     // Placement, not timing: on one worker a synchronous compose would run on
     // `worker_thread`. Asserting on the recorded threads is robust to host load,
     // which is what a tick-gap threshold is not.
+    precall_broker::COMPOSE_RECORDING.store(false, std::sync::atomic::Ordering::Relaxed);
     let compose_threads = precall_broker::COMPOSE_THREADS.lock().unwrap().clone();
     assert!(
         !compose_threads.is_empty(),
@@ -536,11 +538,24 @@ async fn a_failed_delta_leaves_the_surface_untouched() {
     session.send_dirty_regions(&bad, &frame.meta).await.unwrap();
     assert_eq!(wait_for_captures(&db, 2).await, 2);
 
-    // Then a good delta far away from the failed one.
-    let good = vec![(Rect::new(800, 400, 900, 500), solid_jpeg(100, 100, [0, 0, 255]))];
-    let frame = SyntheticFrame { jpeg: vec![], meta: sample_meta(3, "good-3") };
-    session.send_dirty_regions(&good, &frame.meta).await.unwrap();
+    // A delta after the failure must NOT be composed: it is relative to the
+    // frame that could not be applied, so the surface stays invalid.
+    let after = vec![(Rect::new(800, 400, 900, 500), solid_jpeg(100, 100, [0, 0, 255]))];
+    let frame = SyntheticFrame { jpeg: vec![], meta: sample_meta(3, "after-3") };
+    session.send_dirty_regions(&after, &frame.meta).await.unwrap();
     assert_eq!(wait_for_captures(&db, 3).await, 3);
+
+    // A decodable keyframe re-seeds the surface, and then deltas compose again.
+    let again = SyntheticFrame {
+        jpeg: solid_jpeg(1280, 720, [255, 255, 255]),
+        meta: sample_meta(4, "again-4"),
+    };
+    session.send_capture(&again).await.unwrap();
+    assert_eq!(wait_for_captures(&db, 4).await, 4);
+    let good = vec![(Rect::new(800, 400, 900, 500), solid_jpeg(100, 100, [0, 0, 255]))];
+    let frame = SyntheticFrame { jpeg: vec![], meta: sample_meta(5, "good-5") };
+    session.send_dirty_regions(&good, &frame.meta).await.unwrap();
+    assert_eq!(wait_for_captures(&db, 5).await, 5);
     session.close().await.unwrap();
     handle.abort();
 
@@ -560,13 +575,37 @@ async fn a_failed_delta_leaves_the_surface_untouched() {
             .join(format!("{token}.{ext}"))
     };
 
+    // Look captures up by token: the timeline is newest-first and this test now
+    // performs several captures, so indices are not stable.
+    let entry_for = |token: &str| {
+        timeline
+            .iter()
+            .find(|e| ukg.image_token(e.id).unwrap().as_deref() == Some(token))
+            .unwrap_or_else(|| panic!("capture {token} is missing"))
+            .clone()
+    };
+
     // The failed frame is an honest blob, and the surface never saw its first
     // region.
-    let bad_id = timeline[1].id;
-    let bad_token = ukg.image_token(bad_id).unwrap().unwrap();
+    let bad = entry_for("bad-2");
     assert!(
-        objects.exists(&obj_for(&bad_token, timeline[1].timestamp_100ns, "raw")),
+        objects.exists(&obj_for(
+            bad.image_token.as_deref().unwrap(),
+            bad.timestamp_100ns,
+            "raw"
+        )),
         "a frame that cannot be composed whole is stored as a blob"
+    );
+
+    // The delta right after the failure is a blob even though it is valid.
+    let after = entry_for("after-3");
+    assert!(
+        objects.exists(&obj_for(
+            after.image_token.as_deref().unwrap(),
+            after.timestamp_100ns,
+            "raw"
+        )),
+        "a delta relative to a lost frame is stored as a blob"
     );
 
     let good_token = ukg.image_token(timeline[0].id).unwrap().unwrap();

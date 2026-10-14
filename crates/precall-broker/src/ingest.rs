@@ -30,21 +30,32 @@ pub struct LiveEvent {
     pub timestamp_100ns: i64,
 }
 
-/// Threads that have run composition work, for tests that must prove the work
-/// left the runtime worker.
+/// Recording of composition threads, **off unless a test turns it on**.
 ///
 /// Runtime-placement is asserted on this rather than on wall-clock tick gaps,
-/// which depend on host load: a busy runner can deschedule a worker for longer
-/// than an encode even when composition never ran on it.
+/// which depend on host load. It must cost nothing when disabled: a production
+/// broker would otherwise grow this vector forever (one entry per composed
+/// frame) and take a global lock on every composition.
+#[doc(hidden)]
+pub static COMPOSE_RECORDING: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 #[doc(hidden)]
 pub static COMPOSE_THREADS: std::sync::Mutex<Vec<std::thread::ThreadId>> =
     std::sync::Mutex::new(Vec::new());
 
+/// How many thread ids to retain even while recording: enough for a test, and
+/// a hard bound in case one forgets to turn recording off.
+const COMPOSE_THREADS_MAX: usize = 64;
+
 fn record_compose_thread() {
-    COMPOSE_THREADS
-        .lock()
-        .unwrap()
-        .push(std::thread::current().id());
+    if !COMPOSE_RECORDING.load(std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    let mut seen = COMPOSE_THREADS.lock().unwrap();
+    if seen.len() < COMPOSE_THREADS_MAX {
+        seen.push(std::thread::current().id());
+    }
 }
 
 /// All per-client storage handles in one place.
@@ -60,6 +71,11 @@ pub struct ClientStore {
     /// The surface the client advertised in its hello. A one-rectangle frame is
     /// only a keyframe if that rectangle covers this surface.
     pub display: Display,
+    /// Set when a delta could not be applied, or a keyframe could not be
+    /// decoded: the client's later deltas are relative to that lost frame, so
+    /// composing them onto an older surface would leave the areas it changed
+    /// permanently stale. Only a keyframe that decodes clears it.
+    pub surface_invalid: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// `DisplayInfo::surface_id` from the hello: the surface the canvas models.
     ///
     /// One canvas is kept per client, so a frame from a *different* surface
@@ -157,6 +173,7 @@ impl Broker {
             canvas: std::sync::Arc::new(std::sync::Mutex::new(None)),
             display: Display::Unknown,
             primary_surface: 0,
+            surface_invalid: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         })
     }
 
@@ -203,8 +220,6 @@ impl Broker {
                 Display::Surface {
                     width: display.width,
                     height: display.height,
-                    origin_x: display.origin_x,
-                    origin_y: display.origin_y,
                 }
             };
         }
@@ -353,6 +368,12 @@ impl Broker {
                 // value keeps both cases out.
                 let composes = f.surface_id == Some(store.primary_surface);
                 if !composes {
+                    // A refused frame may contain primary-surface updates that are
+                    // now lost, so the surface is no longer a valid base.
+                    store
+                        .surface_invalid
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
+                    *store.canvas.lock().unwrap() = None;
                     warn!(
                         client = %client_id,
                         surface = ?f.surface_id,
@@ -365,17 +386,29 @@ impl Broker {
                 } else if is_full_surface(&f, store.display) {
                     // A keyframe: archive it verbatim, and keep the surface
                     // current from it when this client also sends rectangles.
-                    if store.canvas.lock().unwrap().is_some() {
+                    // Decode when the client has a surface to refresh *or* when
+                    // one was invalidated: a client that never sends deltas pays
+                    // no decode, but a surface that was lost can only be recovered
+                    // by a keyframe.
+                    let needs_surface = store.canvas.lock().unwrap().is_some()
+                        || store
+                            .surface_invalid
+                            .load(std::sync::atomic::Ordering::Relaxed);
+                    if needs_surface {
                         // Decoding a full frame is image work: it goes to the
                         // blocking pool with the rest, never on the runtime
                         // worker that serves this session's reads and timers.
                         let canvas = std::sync::Arc::clone(&store.canvas);
+                        let invalid = std::sync::Arc::clone(&store.surface_invalid);
                         let data = f.data.clone();
                         let cid_log = *client_id;
                         let _ = tokio::task::spawn_blocking(move || {
                             record_compose_thread();
                             match crate::canvas::Canvas::from_jpeg(&data) {
-                                Ok(c) => *canvas.lock().unwrap() = Some(c),
+                                Ok(c) => {
+                                    *canvas.lock().unwrap() = Some(c);
+                                    invalid.store(false, std::sync::atomic::Ordering::Relaxed);
+                                }
                                 Err(e) => {
                                     // Do not keep the old surface: the client's
                                     // later deltas are relative to *this* frame,
@@ -384,6 +417,7 @@ impl Broker {
                                     // stale. Without a surface they are stored as
                                     // blobs until a keyframe that decodes.
                                     *canvas.lock().unwrap() = None;
+                                    invalid.store(true, std::sync::atomic::Ordering::Relaxed);
                                     warn!(
                                         client = %cid_log,
                                         "keyframe not decodable, surface invalidated: {e}"
@@ -410,23 +444,43 @@ impl Broker {
                     // The object read is I/O and stays here; the *decode* of the
                     // base image is image work and goes to the blocking pool
                     // with the rectangles and the encode.
-                    let base = if store.canvas.lock().unwrap().is_none() {
+                    let invalid = store.surface_invalid.load(std::sync::atomic::Ordering::Relaxed);
+                    let base = if !invalid && store.canvas.lock().unwrap().is_none() {
                         Self::last_capture_bytes(&*store, &cid)
                     } else {
                         None
                     };
                     let canvas = std::sync::Arc::clone(&store.canvas);
+                    let surface_invalid = std::sync::Arc::clone(&store.surface_invalid);
                     let rects: Vec<(Rect, bytes::Bytes)> = f.rects.clone();
                     let codec_id = f.codec_id;
-                    match tokio::task::spawn_blocking(move || {
-                        compose(canvas, codec_id, &rects, base)
-                    })
-                    .await
-                    {
-                        Ok(Some(jpeg)) => Some(("jpg", bytes::Bytes::from(jpeg))),
-                        Ok(None) => Some(("raw", f.data.clone())),
-                        Err(e) => {
-                            warn!("composition task failed: {e}");
+                    // A surface known to be invalid (a lost keyframe or a refused
+                    // frame) is not seeded from an older image: the deltas are
+                    // relative to the lost state, so that would publish a stale
+                    // composition. Wait for a keyframe.
+                    let composed = if invalid {
+                        None
+                    } else {
+                        match tokio::task::spawn_blocking(move || {
+                            compose(canvas, codec_id, &rects, base)
+                        })
+                        .await
+                        {
+                            Ok(v) => v,
+                            Err(e) => {
+                                warn!("composition task failed: {e}");
+                                None
+                            }
+                        }
+                    };
+                    match composed {
+                        Some(jpeg) => Some(("jpg", bytes::Bytes::from(jpeg))),
+                        None => {
+                            // Cannot apply this delta: whatever the cause, the
+                            // surface must not be reused, because the next delta is
+                            // relative to *this* frame.
+                            surface_invalid.store(true, std::sync::atomic::Ordering::Relaxed);
+                            *store.canvas.lock().unwrap() = None;
                             Some(("raw", f.data.clone()))
                         }
                     }
@@ -557,32 +611,31 @@ fn is_full_surface(frame: &PendingFrame, display: Display) -> bool {
     let rect = frame.rects[0].0;
     match display {
         Display::Unknown => true,
-        Display::Surface { width, height, origin_x, origin_y } => {
-            // Signed arithmetic on purpose: a rectangle on a display left of the
-            // origin has negative coordinates, and casting those to `u32` wraps
-            // them to huge values that satisfy any `>=` test.
-            let (dw, dh) = (width as i32, height as i32);
-            rect.left as i32 <= origin_x
-                && rect.top as i32 <= origin_y
-                && rect.right as i32 >= origin_x + dw
-                && rect.bottom as i32 >= origin_y + dh
+        Display::Surface { width, height } => {
+            // Signed arithmetic on purpose: casting a negative coordinate to
+            // `u32` wraps it to a huge value that satisfies any `>=` test.
+            rect.left <= 0
+                && rect.top <= 0
+                && rect.right as i32 >= width as i32
+                && rect.bottom as i32 >= height as i32
         }
     }
 }
 
 /// The surface a client told us it captures.
+///
+/// Rectangles on the wire are **output-local** (the client sends
+/// `(0, 0, width, height)` for a whole frame, with the size from the same
+/// output), so the display's desktop *origin* is not applied to them. If a
+/// client ever starts sending virtual-desktop coordinates, keyframe detection
+/// and composition have to become origin-aware together.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Display {
     /// A client that did not say (it may not know yet): a single region is
     /// treated as a keyframe, with a warning, because guessing "delta" would
     /// compose a patch onto a surface that was never seeded.
     Unknown,
-    Surface {
-        width: u32,
-        height: u32,
-        origin_x: i32,
-        origin_y: i32,
-    },
+    Surface { width: u32, height: u32 },
 }
 
 /// Quality of the composed archive frame.

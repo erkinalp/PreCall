@@ -50,6 +50,10 @@ pub struct CaptureFrame {
     /// DXGI reported *move* rectangles: the desktop scrolled. The wire has no
     /// surface-copy operation, so the caller sends a keyframe instead.
     pub moved: bool,
+    /// Duplicator generation that produced this frame: a display mode change
+    /// re-creates the duplicator, and a frame from an older one describes a
+    /// different desktop.
+    pub generation: u64,
     /// Size of the frame's metadata buffer, for diagnostics.
     pub metadata_bytes: u32,
 }
@@ -248,6 +252,7 @@ impl Duplicator {
                     height: self.height,
                     dirty,
                     moved,
+                    generation: 0,
                     metadata_bytes: info.TotalMetadataBufferSize,
                 })
             })();
@@ -310,11 +315,16 @@ pub fn spawn_capture(
     std::thread::Builder::new()
         .name("precall-dxgi".into())
         .spawn(move || {
-            let publish_geometry = |dup: &Duplicator| {
+            // Sharing the generation with the send loop means it can tell a
+            // frame that describes the current desktop from one that predates a
+            // mode change. The closure is `Fn`: it mutates through the mutex, not
+            // through its own captures.
+            let publish_geometry = |dup: &Duplicator| -> u64 {
                 let mut g = geom.lock().unwrap();
                 g.width = dup.width;
                 g.height = dup.height;
                 g.generation += 1;
+                g.generation
             };
             let mut dup = match Duplicator::new(output_index) {
                 Ok(d) => d,
@@ -324,10 +334,15 @@ pub fn spawn_capture(
                     return;
                 }
             };
-            publish_geometry(&dup);
+            // Initialised here rather than before: a dead initialiser is exactly
+            // what `-D unused-assignments` rejects.
+            let mut generation = publish_geometry(&dup);
             loop {
                 match dup.next_frame(100) {
-                    Ok(Some(f)) => producer.publish(f),
+                    Ok(Some(mut f)) => {
+                        f.generation = generation;
+                        producer.publish(f);
+                    }
                     Ok(None) => {}
                     Err(_e) => {
                         // AccessLost / InvalidCall → recreate once; persistent
@@ -338,7 +353,7 @@ pub fn spawn_capture(
                                 // New duplicator: the desktop may have moved to a
                                 // different size (mode change) and its contents
                                 // are not comparable with the previous surface.
-                                publish_geometry(&dup);
+                                generation = publish_geometry(&dup);
                             }
                             Err(e2) => {
                                 on_error(e2);
