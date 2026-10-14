@@ -121,6 +121,12 @@ pub enum ControlMessage {
         frames_sent: u64,
         frames_skipped_unchanged: u64,
         queue_depth: u32,
+        /// Captures the client produced but threw away because the pipeline
+        /// (encode, link, or server) could not carry them. This is the number
+        /// that says "the link is the bottleneck", so it travels with the
+        /// heartbeat instead of living only in client logs.
+        #[serde(default)]
+        frames_dropped: u64,
     },
     /// Server → client: wipe all server-side data for this client and
     /// confirm destruction.

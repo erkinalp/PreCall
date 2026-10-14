@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/precall-frame",
     "crates/precall-proto",
     "crates/precall-store",
     "crates/precall-broker",
@@ -16,6 +17,7 @@ repository = "https://github.com/erkinalp/PreCall"
 version = "0.1.0"
 
 [workspace.dependencies]
+precall-frame = { path = "crates/precall-frame" }
 precall-proto = { path = "crates/precall-proto" }
 precall-store = { path = "crates/precall-store" }
 

@@ -10,8 +10,7 @@ use precall_proto::metadata::{CaptureBatch, ControlMessage, WindowCaptureRecord}
 use precall_proto::{
     read_limited_json, write_limited_json, AuthMethod, Capabilities, ChannelId, ClientHello,
     DisplayInfo, MuxCodec, MuxFrame, ServerHello, ServerReject, PROTOCOL_VERSION,
-    RDPGFX_CMDID_END_FRAME, RDPGFX_CMDID_FRAMEACKNOWLEDGE, RDPGFX_CMDID_START_FRAME,
-    RDPGFX_CMDID_WIRETOSURFACE_1, RDPGFX_CODECID_JPEG, RDPGFX_PIXEL_FORMAT_XRGB_8888,
+    RDPGFX_CODECID_JPEG,
 };
 use std::net::SocketAddr;
 use tokio::net::TcpStream;
@@ -35,7 +34,7 @@ pub struct Connection {
 impl Connection {
     /// Connect + TLS + handshake. PSK is the primary auth method; cert-
     /// fingerprint pinning guards the TLS layer (WebPKI as fallback).
-    pub async fn connect(cfg: &ClientConfig) -> Result<Self, ClientError> {
+    pub async fn connect(cfg: &ClientConfig, display: (u32, u32)) -> Result<Self, ClientError> {
         let client_id = cfg.client_id.unwrap_or_else(Uuid::new_v4);
         let addr: SocketAddr = cfg
             .server
@@ -70,8 +69,8 @@ impl Connection {
             capabilities: Capabilities {
                 displays: vec![DisplayInfo {
                     surface_id: 1,
-                    width: 0,
-                    height: 0,
+                    width: display.0,
+                    height: display.1,
                     origin_x: 0,
                     origin_y: 0,
                 }],
@@ -109,7 +108,40 @@ impl Connection {
     }
 
     /// One RDPGFX frame on GFXRDP: START → W2S_1(JPEG) → END → ACK.
-    /// Layout identical to MS-RDPEGFX; the client assigns the frame id.
+    /// Send one frame: `regions` is either the whole surface (a keyframe) or
+    /// only the rectangles that changed.
+    ///
+    /// The payload is framed by `precall_proto::encode_capture_frame` — the very
+    /// codec that parses it. Hand-rolling these bytes is how the client shipped a
+    /// malformed START_FRAME envelope (flags/length/timestamp mis-sized, so
+    /// `pdu_len` decoded as 0x000C0000) and 4-byte rectangle coordinates where
+    /// the PDU has `i16`; no client frame had ever been decodable, and only
+    /// `precall-mock`, which uses the codec, was covered end-to-end.
+    pub async fn send_frame_regions(
+        &mut self,
+        regions: &[(precall_frame::Rect, Vec<u8>)],
+        timestamp_100ns: u64,
+    ) -> Result<(), ClientError> {
+        self.frame_id += 1;
+        let framed: Vec<(precall_proto::Rect, bytes::Bytes)> = regions
+            .iter()
+            .map(|(r, jpeg)| {
+                (
+                    precall_proto::Rect::new(r.left, r.top, r.right, r.bottom),
+                    bytes::Bytes::copy_from_slice(jpeg),
+                )
+            })
+            .collect();
+        let out = precall_proto::encode_capture_frame(
+            self.frame_id,
+            timestamp_100ns as u32,
+            self.surface_id,
+            &framed,
+        );
+        self.send_mux(ChannelId::GfxRdp, out).await
+    }
+
+    /// Send a whole-desktop keyframe.
     pub async fn send_frame(
         &mut self,
         jpeg: &[u8],
@@ -117,42 +149,14 @@ impl Connection {
         height: u32,
         timestamp_100ns: u64,
     ) -> Result<(), ClientError> {
-        self.frame_id += 1;
-        let fid = self.frame_id;
-        let mut out = BytesMut::new();
-        out.extend_from_slice(&RDPGFX_CMDID_START_FRAME.to_le_bytes());
-        out.extend_from_slice(&0u32.to_le_bytes());
-        out.extend_from_slice(&12u32.to_le_bytes());
-        out.extend_from_slice(&fid.to_le_bytes());
-        out.extend_from_slice(&timestamp_100ns.to_le_bytes());
-        let bl = jpeg.len() as u32;
-        let pdu_len = 8 + 2 + 2 + 1 + 8 + 4 + bl;
-        out.extend_from_slice(&RDPGFX_CMDID_WIRETOSURFACE_1.to_le_bytes());
-        out.extend_from_slice(&0u16.to_le_bytes());
-        out.extend_from_slice(&pdu_len.to_le_bytes());
-        out.extend_from_slice(&(self.surface_id as u32).to_le_bytes()[..2]);
-        out.extend_from_slice(&RDPGFX_CODECID_JPEG.to_le_bytes());
-        out.extend_from_slice(&[RDPGFX_PIXEL_FORMAT_XRGB_8888]);
-        out.extend_from_slice(&0i32.to_le_bytes());
-        out.extend_from_slice(&0i32.to_le_bytes());
-        out.extend_from_slice(&(width as i32).to_le_bytes());
-        out.extend_from_slice(&(height as i32).to_le_bytes());
-        out.extend_from_slice(&bl.to_le_bytes());
-        out.extend_from_slice(jpeg);
-        out.extend_from_slice(&RDPGFX_CMDID_END_FRAME.to_le_bytes());
-        out.extend_from_slice(&0u32.to_le_bytes());
-        out.extend_from_slice(&8u32.to_le_bytes());
-        out.extend_from_slice(&fid.to_le_bytes());
-        out.extend_from_slice(&RDPGFX_CMDID_FRAMEACKNOWLEDGE.to_le_bytes());
-        out.extend_from_slice(&0u32.to_le_bytes());
-        out.extend_from_slice(&20u32.to_le_bytes());
-        out.extend_from_slice(&0u32.to_le_bytes());
-        out.extend_from_slice(&fid.to_le_bytes());
-        out.extend_from_slice(&1u32.to_le_bytes());
-        self.send_mux(ChannelId::GfxRdp, out).await
+        let region = [(
+            precall_frame::Rect::new(0, 0, width as i16, height as i16),
+            jpeg.to_vec(),
+        )];
+        self.send_frame_regions(&region, timestamp_100ns).await
     }
 
-    /// PCMETA batch — one WindowCaptureRecord + app/web/file/region rows.
+
     pub async fn send_meta(&mut self, cap: WindowCaptureRecord) -> Result<(), ClientError> {
         self.seq += 1;
         let batch = CaptureBatch {

@@ -120,3 +120,59 @@ async fn handshake_json_round_trip() {
     assert_eq!(back.client_id, hello.client_id);
     assert_eq!(back.capabilities.displays[0].width, 2560);
 }
+
+/// The client's capture framing must be produced by the codec that parses it.
+///
+/// This is a regression test with teeth: the client hand-rolled these bytes and
+/// emitted a START_FRAME whose flags/length/timestamp fields were mis-sized
+/// (`pdu_len` decoded as 0x000C0000) and 4-byte rectangle coordinates where the
+/// PDU has `i16`. Every end-to-end test drives `precall-mock`, which uses the
+/// codec, so the malformed client framing was invisible until it was read.
+#[test]
+fn capture_framing_round_trips_through_the_codec() {
+    use precall_proto::{encode_capture_frame, GfxPduIter, Rect};
+
+    let regions = vec![
+        (Rect::new(0, 0, 1280, 720), bytes::Bytes::from_static(b"\xff\xd8full\xff\xd9")),
+    ];
+    let framed = encode_capture_frame(7, 0xDEAD_BEEF, 1, &regions);
+    let pdus: Vec<_> = GfxPduIter::new(&framed)
+        .collect::<Result<Vec<_>, _>>()
+        .expect("the client framing must decode");
+    assert_eq!(pdus.len(), 3, "START + one region + END");
+    match &pdus[0] {
+        precall_proto::GfxPdu::StartFrame { frame_id, timestamp } => {
+            assert_eq!(*frame_id, 7);
+            assert_eq!(*timestamp, 0xDEAD_BEEF);
+        }
+        other => panic!("expected START, got {other:?}"),
+    }
+    match &pdus[1] {
+        precall_proto::GfxPdu::WireToSurface1 { dest_rect, bitmap_data, codec_id, .. } => {
+            assert_eq!(*dest_rect, Rect::new(0, 0, 1280, 720));
+            assert_eq!(*codec_id, precall_proto::RDPGFX_CODECID_JPEG);
+            assert_eq!(&bitmap_data[..2], &[0xFF, 0xD8]);
+        }
+        other => panic!("expected a region, got {other:?}"),
+    }
+    assert!(matches!(pdus[2], precall_proto::GfxPdu::EndFrame { frame_id: 7 }));
+
+    // Several rectangles in one frame: one PDU each, exact i16 coordinates.
+    let many = vec![
+        (Rect::new(16, 16, 48, 40), bytes::Bytes::from_static(b"a")),
+        (Rect::new(-4, 8, 12, 30), bytes::Bytes::from_static(b"bb")),
+        (Rect::new(100, 100, 101, 101), bytes::Bytes::from_static(b"ccc")),
+    ];
+    let framed = encode_capture_frame(9, 1, 1, &many);
+    let pdus: Vec<_> = GfxPduIter::new(&framed).collect::<Result<Vec<_>, _>>().unwrap();
+    assert_eq!(pdus.len(), 5, "START + 3 regions + END");
+    for (i, (rect, data)) in many.iter().enumerate() {
+        match &pdus[i + 1] {
+            precall_proto::GfxPdu::WireToSurface1 { dest_rect, bitmap_data, .. } => {
+                assert_eq!(dest_rect, rect, "rectangle {i} (negative origins included)");
+                assert_eq!(bitmap_data.as_ref(), data.as_ref());
+            }
+            other => panic!("expected region {i}, got {other:?}"),
+        }
+    }
+}

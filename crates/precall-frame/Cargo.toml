@@ -1,0 +1,11 @@
+[package]
+name = "precall-frame"
+description = "Platform-independent capture plumbing: newest-frame handoff, frame fingerprinting, capture cadence"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+
+[dev-dependencies]
+image.workspace = true

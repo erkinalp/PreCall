@@ -96,6 +96,11 @@ pub struct Session {
     pub client_id: Uuid,
     seq: u64,
     frame_id: u32,
+    /// The display geometry this session advertised. Full frames must be sent at
+    /// this size: the broker adopts a keyframe only when its image and rectangle
+    /// match the surface it was told about.
+    width: i16,
+    height: i16,
 }
 
 impl Session {
@@ -107,6 +112,24 @@ impl Session {
         auth: AuthMethod,
         client_id: Uuid,
         hostname: &str,
+    ) -> Result<Self, anyhow::Error> {
+        Self::connect_sized(addr, server_name, tls, auth, client_id, hostname, 1280, 720).await
+    }
+
+    /// Connect advertising a specific display size.
+    ///
+    /// The broker only adopts a keyframe whose image matches the advertised
+    /// surface, so a harness that captures at, say, 1920x1080 must say so.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn connect_sized(
+        addr: SocketAddr,
+        server_name: &str,
+        tls: std::sync::Arc<ClientConfig>,
+        auth: AuthMethod,
+        client_id: Uuid,
+        hostname: &str,
+        width: u32,
+        height: u32,
     ) -> Result<Self, anyhow::Error> {
         let stream = TcpStream::connect(addr).await?;
         let connector = TlsConnector::from(tls);
@@ -121,8 +144,8 @@ impl Session {
             capabilities: Capabilities {
                 displays: vec![DisplayInfo {
                     surface_id: 0,
-                    width: 1280,
-                    height: 720,
+                    width,
+                    height,
                     origin_x: 0,
                     origin_y: 0,
                 }],
@@ -140,6 +163,8 @@ impl Session {
             client_id,
             seq: 0,
             frame_id: 0,
+            width: width as i16,
+            height: height as i16,
         })
     }
 
@@ -156,7 +181,7 @@ impl Session {
             surface_id: 0,
             codec_id: RDPGFX_CODECID_JPEG,
             pixel_format: RDPGFX_PIXEL_FORMAT_XRGB_8888,
-            dest_rect: Rect::new(0, 0, 1280, 720),
+            dest_rect: Rect::new(0, 0, self.width, self.height),
             bitmap_data: bytes::Bytes::copy_from_slice(&f.jpeg),
         }
         .encode(&mut gfx);
@@ -177,11 +202,83 @@ impl Session {
         Ok(())
     }
 
+    /// Send one *multi-region* frame: several dirty rectangles inside a single
+    /// START/END pair, the way a dirty-rect capture agent streams a desktop.
+    ///
+    /// `regions` are `(rect, jpeg)` pairs; each is the encoded content of that
+    /// rectangle only.
+    /// Send regions on explicit surface ids — several surfaces in one frame is
+    /// the shape the broker must refuse rather than compose.
+    pub async fn send_regions_mixed(
+        &mut self,
+        regions: &[(u16, Rect, Vec<u8>)],
+        meta: &WindowCaptureRecord,
+    ) -> Result<(), anyhow::Error> {
+        let regions: Vec<(u16, Rect, bytes::Bytes)> = regions
+            .iter()
+            .map(|(s, r, d)| (*s, *r, bytes::Bytes::copy_from_slice(d)))
+            .collect();
+        self.send_regions_inner(&regions, meta).await
+    }
+
+    pub async fn send_dirty_regions(
+        &mut self,
+        regions: &[(Rect, Vec<u8>)],
+        meta: &WindowCaptureRecord,
+    ) -> Result<(), anyhow::Error> {
+        let regions: Vec<(u16, Rect, bytes::Bytes)> = regions
+            .iter()
+            .map(|(r, d)| (0u16, *r, bytes::Bytes::copy_from_slice(d)))
+            .collect();
+        self.send_regions_inner(&regions, meta).await
+    }
+
+    /// One START/END pair carrying `regions`, each on its given surface.
+    async fn send_regions_inner(
+        &mut self,
+        regions: &[(u16, Rect, bytes::Bytes)],
+        meta: &WindowCaptureRecord,
+    ) -> Result<(), anyhow::Error> {
+        self.frame_id += 1;
+        let mut gfx = BytesMut::new();
+        GfxPdu::StartFrame {
+            frame_id: self.frame_id,
+            timestamp: (meta.timestamp_100ns & 0xFFFF_FFFF) as u32,
+        }
+        .encode(&mut gfx);
+        for (surface_id, rect, jpeg) in regions {
+            GfxPdu::WireToSurface1 {
+                surface_id: *surface_id,
+                codec_id: RDPGFX_CODECID_JPEG,
+                pixel_format: RDPGFX_PIXEL_FORMAT_XRGB_8888,
+                dest_rect: *rect,
+                bitmap_data: jpeg.clone(),
+            }
+            .encode(&mut gfx);
+        }
+        GfxPdu::EndFrame { frame_id: self.frame_id }.encode(&mut gfx);
+        self.framed
+            .send(MuxFrame::new(ChannelId::GfxRdp, gfx.freeze()))
+            .await?;
+
+        self.seq += 1;
+        let batch = CaptureBatch {
+            client_id: self.client_id,
+            seq: self.seq,
+            captures: vec![meta.clone()],
+        };
+        self.framed
+            .send(MuxFrame::new(ChannelId::PcMeta, serde_json::to_vec(&batch)?))
+            .await?;
+        Ok(())
+    }
+
     pub async fn heartbeat(&mut self, sent: u64, queue: u32) -> Result<(), anyhow::Error> {
         let msg = ControlMessage::Heartbeat {
             frames_sent: sent,
             frames_skipped_unchanged: 0,
             queue_depth: queue,
+            frames_dropped: 0,
         };
         self.framed
             .send(MuxFrame::new(ChannelId::PcCtrl, serde_json::to_vec(&msg)?))

@@ -132,6 +132,99 @@ rebuild reports the mismatch in `notes` instead of ranking incomparable
 vectors. (The Rust and Python hash fallbacks are different functions and carry
 different ids.)
 
+## Performance envelope (measured, not estimated)
+
+Two operating points matter: **full framerate** (streaming) and **Recall's
+collection cadence** (a capture every few seconds, nothing while the desktop is
+unchanged). Both are reproduced by two harnesses in this repo:
+
+```bash
+cargo run --release -p precall-broker --example frame_throughput   # server + wire
+cargo run --release -p precall-frame  --example client_cost        # client per-frame CPU
+```
+
+Measured on a workstation (1920x1080, ~130-220 KiB/frame JPEG q80, TLS 1.3,
+real handshake, real RDPGFX framing, AES-GCM at rest):
+
+| stage | measured | note |
+|---|---|---|
+| broker ingest, encrypted | **1494 captures/s** (201 MB/s) | end-to-end, sent *and* committed |
+| broker ingest, plaintext objects | 3072 captures/s | at-rest encryption costs ~51% of throughput |
+| `put` + `insert_capture` | ~1980 captures/s combined | store alone never the ceiling |
+| client JPEG q80, desktop-like | 57 ms/frame → **17 fps per core** | photographic: 116 ms → 8.6 fps, 2.8 MiB/frame |
+| client dedup fingerprint | 1.18 ms/frame exact (7.4% of a 16 ms budget) | byte-at-a-time would be 7.5 ms; a *sampled* stride was cheaper but wrong (see below) |
+
+So at 1080p the **server is not the constraint** (60 fps needs ~4% of it), and
+neither is the number of clients. The constraint is per client and it is the
+link, then the encoder:
+
+| operating point | wire per client | client CPU (one core) |
+|---|---|---|
+| streaming, 16 ms cadence | 3.7 MB/s desktop-like, **23.8 MB/s photographic** (≈30-190 Mbps up) | 1.05 cores to 6.8 cores |
+| Recall cadence, 3000 ms | 37 KB/s to 950 KB/s | ~3% of a core |
+
+That is the honest reason Recall collects a capture every few seconds instead of
+streaming: a client-server design at full framerate is bounded by the *uplink*
+(and by the encoder's CPU), not by the datacenter.
+
+### Dirty rectangles, and why the server composes them
+
+The lever is to send only what changed. The client takes DXGI's dirty
+rectangles, plans a delta (`precall_frame::plan_capture` — scrolling and
+oversized changes fall back to a keyframe, since the wire has no surface-copy
+operation), encodes each rectangle on its own and sends them as
+`WIRE_TO_SURFACE` PDUs inside one frame. The broker applies them to a per-client
+**desktop surface** and archives the composed result as an ordinary full-frame
+JPEG (`precall-broker/src/canvas.rs`).
+
+That choice is deliberate: it keeps the reader-facing contract — `ukg.db` plus
+one image per capture, Recall's own layout — so the snapshot route, Click-to-Do,
+the image embedder, the export and any migration to or from Recall keep working
+without a compositor. It is also what the RDP graphics pipeline does
+(`WIRE_TO_SURFACE` applies bitmaps to a *surface* the server owns). Storing
+deltas would have been cheaper to ingest and worse everywhere else.
+
+Measured, same harness, two rectangles per capture (5.1 KiB on the wire instead
+of 253 KiB — **50x less**):
+
+| path | wire per capture | server per capture | client per capture |
+|---|---|---|---|
+| full frames | 253 KiB | ~0.7 ms (stored verbatim) | 58 ms encode |
+| dirty rects | 5.1 KiB | **50 ms** (canvas compose + encode, 1080p) | ~2 ms encode |
+
+So dirty rectangles move the encode from the client to the server. At Recall's
+cadence that is 50 ms per three seconds — **1.7% of one core per client** — while
+the client drops from 58 ms to a couple of milliseconds and the uplink from
+253 KiB to 5 KiB. At a 60 fps *stream* the server pays ~3 cores per client,
+which is the case for a hardware encoder (Media Foundation on Windows; the
+measured figure is the software JPEG path). The knob that decides it is the
+capture cadence: `16` ms is streaming, `3000` ms is Recall, and the server's
+cost per capture does not change.
+
+Two invariants keep a client honest at *both* operating points, and both are
+enforced by `precall-frame` and tested:
+
+* **bounded memory, drop-oldest.** The capture thread publishes into a
+  one-frame slot, not a queue: `published = taken + dropped + resident`, with
+  `resident <= 1`. A queue would turn a slow link into unbounded growth and a
+  stream showing a desktop from minutes ago. The heartbeat carries
+  `frames_dropped`, so link pressure is visible server-side instead of living in
+  client logs.
+* **one cadence policy.** `capture_interval_ms()` floors at 10 ms (100
+  captures/s) and passes anything else through, so `16` is streaming and `3000`
+  is Recall. (The client used to floor at 200 ms — a hard 5 captures/s ceiling
+  whatever was configured.)
+* **fingerprinting is exact, not sampled.** An earlier revision sampled one
+  byte per 64; because a 1920-pixel BGRA row is 7680 bytes (a multiple of 64)
+  the stride landed on the same blue byte of the same columns in every row, so a
+  red- or green-only update could fingerprint identically and be deduped away —
+  a real screen change never recorded. The word-wise fold reads every byte for
+  1.18 ms/frame.
+* **a dead capture worker is visible.** `LatestSlot::close()` wakes the bridge,
+  drops the sender and ends the session, so a client whose duplication was lost
+  cannot keep heartbeating while capturing nothing (the run loop restarts the
+  worker on its next pass).
+
 ## Repo layout
 
 ```
