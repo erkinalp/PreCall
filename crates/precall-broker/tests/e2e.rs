@@ -403,11 +403,11 @@ async fn a_single_rectangle_delta_composes_onto_the_surface() {
 /// If that ran on the session's own runtime worker, a handful of dirty-rectangle
 /// clients would starve socket reads and heartbeats for *healthy* sessions too.
 ///
-/// This pins the offload with a liveness probe on a **single-worker** runtime:
-/// the probe measures the largest gap between its own 5 ms ticks while a delta is
-/// composed. Synchronous composition would show up as a gap of at least one
-/// encode; offloaded composition leaves the worker free, so the gaps stay near
-/// the tick period.
+/// This pins the offload by **placement** rather than by timing: on a
+/// single-worker runtime, image work must never be recorded on the worker thread
+/// that runs the session. (A tick-gap threshold would depend on host load — a
+/// busy runner can deschedule a worker for longer than an encode even when
+/// composition never ran on it.)
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn composing_a_delta_does_not_block_the_runtime_worker() {
     let dir = tempfile::tempdir().unwrap();
@@ -440,22 +440,10 @@ async fn composing_a_delta_does_not_block_the_runtime_worker() {
     session.send_capture(&base).await.unwrap();
     tokio::time::sleep(std::time::Duration::from_millis(250)).await;
 
-    // Probe: the largest gap between consecutive 5 ms ticks.
-    let worst_gap_ms = Arc::new(std::sync::atomic::AtomicU64::new(0));
-    let probe = {
-        let worst = Arc::clone(&worst_gap_ms);
-        tokio::spawn(async move {
-            let mut iv = tokio::time::interval(std::time::Duration::from_millis(5));
-            let mut last = std::time::Instant::now();
-            loop {
-                iv.tick().await;
-                let now = std::time::Instant::now();
-                let gap = now.duration_since(last).as_millis() as u64;
-                last = now;
-                worst.fetch_max(gap, std::sync::atomic::Ordering::Relaxed);
-            }
-        })
-    };
+    // The runtime worker this test (and every task of it) runs on, with
+    // `worker_threads = 1`. Composition must not appear here.
+    let worker_thread = std::thread::current().id();
+    precall_broker::COMPOSE_THREADS.lock().unwrap().clear();
 
     // One delta: this is what triggers the 1080p compose + encode.
     let regions = vec![(Rect::new(100, 100, 300, 200), solid_jpeg(200, 100, [255, 0, 0]))];
@@ -468,7 +456,6 @@ async fn composing_a_delta_does_not_block_the_runtime_worker() {
     // worker everything (the 1080p encode, the test's own awaits) shares a
     // thread, so a fixed sleep would be the flakiest part of this test.
     let landed = wait_for_captures(&dir.path().join(client_id.to_string()).join("ukg.db"), 2).await;
-    probe.abort();
     assert_eq!(landed, 2, "the delta reached the store");
 
     // Confirm the delta was actually composed (otherwise this proves nothing).
@@ -491,11 +478,177 @@ async fn composing_a_delta_does_not_block_the_runtime_worker() {
     assert_eq!((img.width(), img.height()), (1920, 1080));
     handle.abort();
 
-    let worst = worst_gap_ms.load(std::sync::atomic::Ordering::Relaxed);
-    // The trap: on one worker, a synchronous compose would hold the runtime for
-    // the whole encode (~45 ms measured for this frame size).
+    // Placement, not timing: on one worker a synchronous compose would run on
+    // `worker_thread`. Asserting on the recorded threads is robust to host load,
+    // which is what a tick-gap threshold is not.
+    let compose_threads = precall_broker::COMPOSE_THREADS.lock().unwrap().clone();
     assert!(
-        worst < 35,
-        "a {worst} ms gap between runtime ticks means composition blocked the worker"
+        !compose_threads.is_empty(),
+        "the delta was composed (otherwise this proves nothing)"
+    );
+    assert!(
+        compose_threads.iter().all(|t| *t != worker_thread),
+        "composition ran on the runtime worker: {compose_threads:?} contains {worker_thread:?}"
+    );
+}
+
+/// A delta whose second region is undecodable must not leave the *first* region
+/// applied to the surface: composition validates every region before touching
+/// the canvas, and a failed frame is stored as a blob.
+#[tokio::test]
+async fn a_failed_delta_leaves_the_surface_untouched() {
+    let dir = tempfile::tempdir().unwrap();
+    let (certs, key, fingerprint) = test_cert();
+    let tls_cfg = tls::server_config_from(certs, key).unwrap();
+    let broker = Arc::new(Broker::new(config(dir.path()), tls_cfg).unwrap());
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let b = Arc::clone(&broker);
+    let handle = tokio::spawn(async move { b.run_on(listener).await });
+
+    let client_id = Uuid::new_v4();
+    let tls = pinned_client_config(&fingerprint).unwrap();
+    let mut session = Session::connect(
+        addr,
+        "localhost",
+        tls,
+        AuthMethod::Psk { token: PSK.into() },
+        client_id,
+        "ATOMIC",
+    )
+    .await
+    .expect("handshake");
+
+    let base = SyntheticFrame {
+        jpeg: solid_jpeg(1280, 720, [255, 255, 255]),
+        meta: sample_meta(1, "base-1"),
+    };
+    session.send_capture(&base).await.unwrap();
+    let db = dir.path().join(client_id.to_string()).join("ukg.db");
+    assert_eq!(wait_for_captures(&db, 1).await, 1);
+
+    // Region 1 is fine (red), region 2 claims 100x100 but carries a 20x20 image.
+    let bad = vec![
+        (Rect::new(10, 10, 110, 110), solid_jpeg(100, 100, [255, 0, 0])),
+        (Rect::new(200, 200, 300, 300), solid_jpeg(20, 20, [0, 255, 0])),
+    ];
+    let frame = SyntheticFrame { jpeg: vec![], meta: sample_meta(2, "bad-2") };
+    session.send_dirty_regions(&bad, &frame.meta).await.unwrap();
+    assert_eq!(wait_for_captures(&db, 2).await, 2);
+
+    // Then a good delta far away from the failed one.
+    let good = vec![(Rect::new(800, 400, 900, 500), solid_jpeg(100, 100, [0, 0, 255]))];
+    let frame = SyntheticFrame { jpeg: vec![], meta: sample_meta(3, "good-3") };
+    session.send_dirty_regions(&good, &frame.meta).await.unwrap();
+    assert_eq!(wait_for_captures(&db, 3).await, 3);
+    session.close().await.unwrap();
+    handle.abort();
+
+    let client_dir = dir.path().join(client_id.to_string());
+    let ukg = Ukg::open(&db).unwrap();
+    let timeline = ukg.timeline(None, 10).unwrap();
+    let key = load_or_create_key(dir.path()).unwrap();
+    let objects = ObjectStore::encrypted(client_dir.join("objects"), key).unwrap();
+    // Object keys are relative to the object root, so they carry exactly one
+    // client-id segment (`{client}/{YYYY}/{MM}/{DD}/{token}.{ext}`).
+    let obj_for = |token: &str, ts: i64, ext: &str| {
+        let (y, m, d) = precall_broker::filetime_to_ymd(ts);
+        std::path::PathBuf::from(client_id.to_string())
+            .join(format!("{y:04}"))
+            .join(format!("{m:02}"))
+            .join(format!("{d:02}"))
+            .join(format!("{token}.{ext}"))
+    };
+
+    // The failed frame is an honest blob, and the surface never saw its first
+    // region.
+    let bad_id = timeline[1].id;
+    let bad_token = ukg.image_token(bad_id).unwrap().unwrap();
+    assert!(
+        objects.exists(&obj_for(&bad_token, timeline[1].timestamp_100ns, "raw")),
+        "a frame that cannot be composed whole is stored as a blob"
+    );
+
+    let good_token = ukg.image_token(timeline[0].id).unwrap().unwrap();
+    let rel = obj_for(&good_token, timeline[0].timestamp_100ns, "jpg");
+    let bytes = objects
+        .get(&client_id.to_string(), &rel, &good_token)
+        .unwrap();
+    let img = image::load_from_memory(&bytes).unwrap().to_rgb8();
+    let near = |p: [u8; 3], want: [u8; 3]| p.iter().zip(want.iter()).all(|(a, b)| a.abs_diff(*b) <= 6);
+    assert!(near(img.get_pixel(850, 450).0, [0, 0, 255]), "the good delta composed");
+    assert!(
+        near(img.get_pixel(60, 60).0, [255, 255, 255]),
+        "the failed frame's valid region must not be on the surface: {:?}",
+        img.get_pixel(60, 60).0
+    );
+}
+
+/// A rectangle with negative coordinates must be compared as signed: casting
+/// `-3000` to `u32` wraps to a huge value that satisfies any "reaches the
+/// display" test, which would archive a patch to the left of the desktop as a
+/// full screenshot.
+#[tokio::test]
+async fn a_negative_rectangle_is_not_a_keyframe() {
+    let dir = tempfile::tempdir().unwrap();
+    let (certs, key, fingerprint) = test_cert();
+    let tls_cfg = tls::server_config_from(certs, key).unwrap();
+    let broker = Arc::new(Broker::new(config(dir.path()), tls_cfg).unwrap());
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let b = Arc::clone(&broker);
+    let handle = tokio::spawn(async move { b.run_on(listener).await });
+
+    let client_id = Uuid::new_v4();
+    let tls = pinned_client_config(&fingerprint).unwrap();
+    let mut session = Session::connect(
+        addr,
+        "localhost",
+        tls,
+        AuthMethod::Psk { token: PSK.into() },
+        client_id,
+        "NEGATIVE",
+    )
+    .await
+    .expect("handshake");
+
+    let base = SyntheticFrame {
+        jpeg: solid_jpeg(1280, 720, [255, 255, 255]),
+        meta: sample_meta(1, "base-1"),
+    };
+    session.send_capture(&base).await.unwrap();
+    let db = dir.path().join(client_id.to_string()).join("ukg.db");
+    assert_eq!(wait_for_captures(&db, 1).await, 1);
+
+    // Entirely left of and above the origin.
+    let off = vec![(Rect::new(-4000, -4000, -3000, -3000), solid_jpeg(1000, 1000, [255, 0, 0]))];
+    let frame = SyntheticFrame { jpeg: vec![], meta: sample_meta(2, "off-2") };
+    session.send_dirty_regions(&off, &frame.meta).await.unwrap();
+    assert_eq!(wait_for_captures(&db, 2).await, 2);
+    session.close().await.unwrap();
+    handle.abort();
+
+    let client_dir = dir.path().join(client_id.to_string());
+    let ukg = Ukg::open(&db).unwrap();
+    let timeline = ukg.timeline(None, 10).unwrap();
+    let token = ukg.image_token(timeline[0].id).unwrap().unwrap();
+    let (y, m, d) = precall_broker::filetime_to_ymd(timeline[0].timestamp_100ns);
+    let rel = std::path::PathBuf::from(client_id.to_string())
+        .join(format!("{y:04}"))
+        .join(format!("{m:02}"))
+        .join(format!("{d:02}"))
+        .join(format!("{token}.jpg"));
+    let key = load_or_create_key(dir.path()).unwrap();
+    let objects = ObjectStore::encrypted(client_dir.join("objects"), key).unwrap();
+    assert!(
+        objects.exists(&rel),
+        "a negative rectangle is a delta: composed against the surface"
+    );
+    let bytes = objects.get(&client_id.to_string(), &rel, &token).unwrap();
+    let img = image::load_from_memory(&bytes).unwrap();
+    assert_eq!(
+        (img.width(), img.height()),
+        (1280, 720),
+        "the archive stays the desktop, not the patch"
     );
 }

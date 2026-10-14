@@ -8,6 +8,8 @@
 
 mod auth;
 pub mod canvas;
+#[doc(hidden)]
+pub use ingest::COMPOSE_THREADS;
 mod config;
 mod ingest;
 pub mod tls;

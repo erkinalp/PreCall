@@ -82,14 +82,19 @@ impl Canvas {
     /// A region whose decoded size does not match the rectangle it claims to
     /// cover is refused rather than silently stretched — the coordinates are
     /// what the timeline and Click-to-Do overlays are indexed against.
-    pub fn apply_region(
-        &mut self,
+    /// Decode and validate one region **without touching the surface**.
+    ///
+    /// Composition validates every region first and only then blits: applying
+    /// them one by one would leave a partially updated surface behind when a
+    /// later region is undecodable or the wrong size, and that half-applied
+    /// surface would be the base for every later archive frame.
+    pub fn decode_region(
         left: i16,
         top: i16,
         right: i16,
         bottom: i16,
         encoded: &[u8],
-    ) -> Result<(), CanvasError> {
+    ) -> Result<image::RgbImage, CanvasError> {
         let img = image::load_from_memory(encoded)
             .map_err(|e| CanvasError::Decode(e.to_string()))?
             .to_rgb8();
@@ -103,8 +108,14 @@ impl Canvas {
                 rh: rh as u32,
             });
         }
-        // Clip against the surface: RDPGFX rectangles are virtual-desktop
-        // coordinates, so an origin may be negative or extend past the surface.
+        Ok(img)
+    }
+
+    /// Blit an already-validated region. Cannot fail.
+    ///
+    /// Clip against the surface: RDPGFX rectangles are virtual-desktop
+    /// coordinates, so an origin may be negative or extend past the surface.
+    pub fn blit(&mut self, left: i16, top: i16, img: &image::RgbImage) {
         let (l, t) = (left as i32, top as i32);
         for row in 0..img.height() as i32 {
             let dst_y = t + row;
@@ -121,6 +132,19 @@ impl Canvas {
             let dst = ((dst_y as usize) * (self.width as usize) + (l + first) as usize) * 3;
             self.rgb[dst..dst + span].copy_from_slice(&img.as_raw()[src..src + span]);
         }
+    }
+
+    /// Decode, validate and apply one region.
+    pub fn apply_region(
+        &mut self,
+        left: i16,
+        top: i16,
+        right: i16,
+        bottom: i16,
+        encoded: &[u8],
+    ) -> Result<(), CanvasError> {
+        let img = Self::decode_region(left, top, right, bottom, encoded)?;
+        self.blit(left, top, &img);
         Ok(())
     }
 

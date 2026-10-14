@@ -145,6 +145,10 @@ pub async fn run(cfg: ClientConfig, mut stop: watch::Receiver<bool>) -> Result<(
         // surface must be rebuilt at the new size.
         let advertised = display;
         let mut last_generation = capture_geometry.generation;
+        // Frames captured before this handshake describe the previous session
+        // (possibly at a different size); a forced keyframe must not be an old
+        // frame out of the channel.
+        while frame_chan.try_recv().is_ok() {}
         let conn = match Connection::connect(&cfg, display).await {
             Ok(c) => {
                 backoff = std::time::Duration::from_millis(500);
@@ -172,6 +176,10 @@ pub async fn run(cfg: ClientConfig, mut stop: watch::Receiver<bool>) -> Result<(
         let mut hb_tick =
             tokio::time::interval(std::time::Duration::from_millis(conn.hello.heartbeat_interval_ms.max(5000) as u64));
         let mut latest_frame: Option<BridgedFrame> = None;
+        // The fingerprint describes the frame the *broker* holds, and this is a
+        // new session with no surface: never let the previous session's hash
+        // suppress the keyframe this one needs.
+        last_hash = None;
         // Changes reported since the last capture we sent. DXGI reports them
         // relative to the previous *acquired* frame, so dropping any would apply
         // only the newest change to the server's surface and archive stale
@@ -253,7 +261,7 @@ pub async fn run(cfg: ClientConfig, mut stop: watch::Receiver<bool>) -> Result<(
                     // after the frame is actually sent (below), so a dropped
                     // preparation cannot leave a hash for a frame the broker
                     // never received.
-                    let fallback_hash = if pending_dirty.is_none() {
+                    let fallback_hash = if pending_dirty.is_none() && !force_keyframe {
                         let hash = precall_frame::frame_fingerprint(&frame.bgra);
                         if last_hash == Some(hash) {
                             counters.frames_skipped_unchanged += 1;
@@ -309,24 +317,39 @@ pub async fn run(cfg: ClientConfig, mut stop: watch::Receiver<bool>) -> Result<(
                             // rectangles instead of 8 MiB of pixels.
                             let payload = match &region_plan {
                                 precall_frame::CapturePlan::Regions(rects) => {
+                                    // Every planned rectangle must make it: the
+                                    // send path clears the accumulated dirty set,
+                                    // so a silently omitted region would never be
+                                    // applied to the broker's surface. Any
+                                    // failure falls back to the whole frame.
                                     let mut out = Vec::with_capacity(rects.len());
+                                    let mut complete = true;
                                     for r in rects {
-                                        if let Some((region, rw, rh)) = precall_frame::extract_bgra_region(
-                                            &bgra, width, height, r,
-                                        ) {
-                                            if let Ok(jpeg) = encode_jpeg(&region, rw, rh, 80) {
-                                                out.push((*r, jpeg));
+                                        match precall_frame::extract_bgra_region(&bgra, width, height, r)
+                                        {
+                                            Some((region, rw, rh)) => match encode_jpeg(&region, rw, rh, 80) {
+                                                Ok(jpeg) => out.push((*r, jpeg)),
+                                                Err(e) => {
+                                                    tracing::warn!("region encode failed: {e}");
+                                                    complete = false;
+                                                    break;
+                                                }
+                                            },
+                                            None => {
+                                                tracing::warn!("region extraction failed");
+                                                complete = false;
+                                                break;
                                             }
                                         }
                                     }
-                                    if out.is_empty() {
+                                    if complete && !out.is_empty() {
+                                        Payload::Regions(out)
+                                    } else {
                                         Payload::Full {
                                             jpeg: encode_jpeg(&bgra, width, height, 80)?,
                                             width,
                                             height,
                                         }
-                                    } else {
-                                        Payload::Regions(out)
                                     }
                                 }
                                 _ => Payload::Full {
@@ -505,6 +528,11 @@ fn absorb_meta(
         (None, Some(_)) => {}
     }
     *moved |= frame_moved;
+    // A busy desktop can report many disjoint rectangles between ticks; at a
+    // long cadence the set would otherwise grow far past the per-capture budget
+    // and every absorb would re-merge a growing vector. Past budget the plan is
+    // necessarily a keyframe anyway.
+    bound_pending(pending);
 }
 
 /// Keep an accumulating delta bounded: past the per-capture rectangle budget the

@@ -30,6 +30,23 @@ pub struct LiveEvent {
     pub timestamp_100ns: i64,
 }
 
+/// Threads that have run composition work, for tests that must prove the work
+/// left the runtime worker.
+///
+/// Runtime-placement is asserted on this rather than on wall-clock tick gaps,
+/// which depend on host load: a busy runner can deschedule a worker for longer
+/// than an encode even when composition never ran on it.
+#[doc(hidden)]
+pub static COMPOSE_THREADS: std::sync::Mutex<Vec<std::thread::ThreadId>> =
+    std::sync::Mutex::new(Vec::new());
+
+fn record_compose_thread() {
+    COMPOSE_THREADS
+        .lock()
+        .unwrap()
+        .push(std::thread::current().id());
+}
+
 /// All per-client storage handles in one place.
 pub struct ClientStore {
     pub ukg: Ukg,
@@ -40,10 +57,16 @@ pub struct ClientStore {
     /// sends dirty rectangles. A full-frame-only client never pays a decode:
     /// its frames are archived verbatim, exactly as before.
     pub canvas: std::sync::Arc<std::sync::Mutex<Option<crate::canvas::Canvas>>>,
-    /// Display size the client advertised in its hello, `(0, 0)` if it did not
-    /// say. A one-rectangle frame is only a keyframe if that rectangle covers
-    /// this surface.
-    pub display: (u32, u32),
+    /// The surface the client advertised in its hello. A one-rectangle frame is
+    /// only a keyframe if that rectangle covers this surface.
+    pub display: Display,
+    /// `DisplayInfo::surface_id` from the hello: the surface the canvas models.
+    ///
+    /// One canvas is kept per client, so a frame from a *different* surface
+    /// cannot be composed onto it — multi-surface clients are not modelled yet,
+    /// and such a frame is stored as an honest region blob rather than
+    /// corrupting the archive.
+    pub primary_surface: u16,
 }
 
 pub struct Broker {
@@ -132,7 +155,8 @@ impl Broker {
             text_index,
             image_index,
             canvas: std::sync::Arc::new(std::sync::Mutex::new(None)),
-            display: (0, 0),
+            display: Display::Unknown,
+            primary_surface: 0,
         })
     }
 
@@ -172,7 +196,17 @@ impl Broker {
         }
         let mut store = self.open_store(hello.client_id)?;
         if let Some(display) = hello.capabilities.displays.first() {
-            store.display = (display.width, display.height);
+            store.primary_surface = display.surface_id;
+            store.display = if display.width == 0 || display.height == 0 {
+                Display::Unknown
+            } else {
+                Display::Surface {
+                    width: display.width,
+                    height: display.height,
+                    origin_x: display.origin_x,
+                    origin_y: display.origin_y,
+                }
+            };
         }
         let cid = hello.client_id.to_string();
         let now = filetime_now() as i64;
@@ -258,8 +292,14 @@ impl Broker {
             let pdu = pdu?;
             match pdu {
                 GfxPdu::StartFrame { frame_id, timestamp } => frames.begin(frame_id, timestamp),
-                GfxPdu::WireToSurface1 { codec_id, dest_rect, bitmap_data, .. } => {
-                    frames.region(codec_id, dest_rect, bitmap_data);
+                GfxPdu::WireToSurface1 {
+                    surface_id,
+                    codec_id,
+                    dest_rect,
+                    bitmap_data,
+                    ..
+                } => {
+                    frames.region(surface_id, codec_id, dest_rect, bitmap_data);
                 }
                 GfxPdu::EndFrame { frame_id } => {
                     if let Some(done) = frames.finish(frame_id) {
@@ -307,7 +347,18 @@ impl Broker {
                 // route, image embedder, timeline, export — keeps seeing one
                 // full-frame image per capture, exactly as Recall's own store
                 // does. (RDPEGFX composes into a surface the same way.)
-                let payload: Option<(&str, bytes::Bytes)> = if is_full_surface(&f, store.display) {
+                // A frame from another surface would corrupt the one canvas we
+                // keep; store the blob and say why.
+                if f.surface_id.is_some_and(|s| s != store.primary_surface) {
+                    warn!(
+                        client = %client_id,
+                        surface = ?f.surface_id,
+                        "frame from a surface other than the advertised one; storing the region blob"
+                    );
+                }
+                let payload: Option<(&str, bytes::Bytes)> = if f.surface_id.is_some_and(|s| s != store.primary_surface) {
+                    Some(("raw", f.data.clone()))
+                } else if is_full_surface(&f, store.display) {
                     // A keyframe: archive it verbatim, and keep the surface
                     // current from it when this client also sends rectangles.
                     if store.canvas.lock().unwrap().is_some() {
@@ -318,6 +369,7 @@ impl Broker {
                         let data = f.data.clone();
                         let cid_log = *client_id;
                         let _ = tokio::task::spawn_blocking(move || {
+                            record_compose_thread();
                             match crate::canvas::Canvas::from_jpeg(&data) {
                                 Ok(c) => *canvas.lock().unwrap() = Some(c),
                                 Err(e) => warn!(client = %cid_log, "keyframe not decodable: {e}"),
@@ -387,22 +439,41 @@ impl Broker {
     /// client that only ever sends full frames never pays a decode at all: the
     /// surface is built the moment it is needed.
     fn last_capture_bytes(store: &ClientStore, client_id: &str) -> Option<bytes::Bytes> {
-        let entry = store.ukg.timeline(None, 1).ok()?.into_iter().next()?;
-        let token = store.ukg.image_token(entry.id).ok()??;
-        let rel = ObjectStore::key_path(
-            client_id,
-            filetime_to_ymd(entry.timestamp_100ns),
-            &token,
-            "jpg",
-        );
-        if !store.objects.exists(&rel) {
-            return None;
+        // Walk back to the newest capture that actually has an archived *image*:
+        // a capture stored as a region blob (composition failed, or the client
+        // was paused) has no JPEG, and stopping at it would leave the client
+        // permanently unable to seed a surface — every later delta degraded to a
+        // blob. Bounded, so a long run of blobs cannot turn this into a scan.
+        const LOOKBACK: i64 = 64;
+        for entry in store.ukg.timeline(None, LOOKBACK).ok()? {
+            let Some(token) = store.ukg.image_token(entry.id).ok().flatten() else {
+                continue;
+            };
+            let rel = ObjectStore::key_path(
+                client_id,
+                filetime_to_ymd(entry.timestamp_100ns),
+                &token,
+                "jpg",
+            );
+            if !store.objects.exists(&rel) {
+                continue;
+            }
+            match store.objects.get(client_id, &rel, &token) {
+                Ok(bytes) => {
+                    debug!(
+                        client_id,
+                        capture = entry.id,
+                        "surface seeded from an archived frame"
+                    );
+                    return Some(bytes.into());
+                }
+                Err(e) => {
+                    debug!(client_id, capture = entry.id, "cannot read seed frame: {e}");
+                    continue;
+                }
+            }
         }
-        store
-            .objects
-            .get(client_id, &rel, &token)
-            .ok()
-            .map(bytes::Bytes::from)
+        None
     }
 
     /// PCAUDIO payload: `[u16 header_len][json {token}][opus bytes]`.
@@ -463,23 +534,39 @@ impl Broker {
 /// keeps the old behaviour: one JPEG region is treated as a full frame, with a
 /// warning, because guessing "delta" there would compose a patch onto a surface
 /// that was never seeded.
-fn is_full_surface(frame: &PendingFrame, display: (u32, u32)) -> bool {
+fn is_full_surface(frame: &PendingFrame, display: Display) -> bool {
     if frame.codec_id != RDPGFX_CODECID_JPEG || frame.rects.len() != 1 {
         return false;
     }
     let rect = frame.rects[0].0;
-    let covers = rect.left <= 0 && rect.top <= 0;
     match display {
-        (0, _) | (_, 0) => {
-            if !frame.rects.is_empty() && !covers {
-                warn!(
-                    "client advertises no display size; treating a single region as a keyframe"
-                );
-            }
-            true
+        Display::Unknown => true,
+        Display::Surface { width, height, origin_x, origin_y } => {
+            // Signed arithmetic on purpose: a rectangle on a display left of the
+            // origin has negative coordinates, and casting those to `u32` wraps
+            // them to huge values that satisfy any `>=` test.
+            let (dw, dh) = (width as i32, height as i32);
+            rect.left as i32 <= origin_x
+                && rect.top as i32 <= origin_y
+                && rect.right as i32 >= origin_x + dw
+                && rect.bottom as i32 >= origin_y + dh
         }
-        (dw, dh) => covers && rect.right as u32 >= dw && rect.bottom as u32 >= dh,
     }
+}
+
+/// The surface a client told us it captures.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Display {
+    /// A client that did not say (it may not know yet): a single region is
+    /// treated as a keyframe, with a warning, because guessing "delta" would
+    /// compose a patch onto a surface that was never seeded.
+    Unknown,
+    Surface {
+        width: u32,
+        height: u32,
+        origin_x: i32,
+        origin_y: i32,
+    },
 }
 
 /// Quality of the composed archive frame.
@@ -498,12 +585,26 @@ fn compose(
     rects: &[(Rect, bytes::Bytes)],
     base: Option<bytes::Bytes>,
 ) -> Option<Vec<u8>> {
+    record_compose_thread();
     if codec_id != RDPGFX_CODECID_JPEG {
         warn!(
             codec = codec_name(codec_id),
             "region codec cannot be composed; storing the blob"
         );
         return None;
+    }
+    // Validate every region *before* touching the surface, so a bad rectangle
+    // cannot leave a half-applied canvas behind for the next archive frame.
+    let mut decoded = Vec::with_capacity(rects.len());
+    for (rect, data) in rects {
+        match crate::canvas::Canvas::decode_region(rect.left, rect.top, rect.right, rect.bottom, data)
+        {
+            Ok(img) => decoded.push((*rect, img)),
+            Err(e) => {
+                warn!("region refused: {e}");
+                return None;
+            }
+        }
     }
     let mut guard = canvas.lock().unwrap();
     if guard.is_none() {
@@ -524,11 +625,8 @@ fn compose(
         }
     }
     let canvas = guard.as_mut()?;
-    for (rect, data) in rects {
-        if let Err(e) = canvas.apply_region(rect.left, rect.top, rect.right, rect.bottom, data) {
-            warn!("region refused: {e}");
-            return None;
-        }
+    for (rect, img) in &decoded {
+        canvas.blit(rect.left, rect.top, img);
     }
     match canvas.encode_jpeg(COMPOSED_JPEG_QUALITY) {
         Ok(jpeg) => Some(jpeg),
@@ -549,13 +647,16 @@ struct PendingFrame {
     /// The rectangles and their payloads, when this frame is a dirty-rect
     /// update — what the compositor needs.
     rects: Vec<(Rect, bytes::Bytes)>,
+    /// Surface the rectangles came from. A frame whose rectangles span several
+    /// surfaces cannot be composed into the single canvas.
+    surface_id: Option<u16>,
 }
 
 /// Accumulates START/W2S*/END state.
 struct FrameAssembler {
     current_id: Option<u32>,
     timestamp: u32,
-    regions: Vec<(u16, Rect, bytes::Bytes)>,
+    regions: Vec<(u16, u16, Rect, bytes::Bytes)>,
 }
 
 impl FrameAssembler {
@@ -567,9 +668,9 @@ impl FrameAssembler {
         self.timestamp = timestamp;
         self.regions.clear();
     }
-    fn region(&mut self, codec_id: u16, rect: Rect, data: bytes::Bytes) {
+    fn region(&mut self, surface_id: u16, codec_id: u16, rect: Rect, data: bytes::Bytes) {
         if self.current_id.is_some() {
-            self.regions.push((codec_id, rect, data));
+            self.regions.push((surface_id, codec_id, rect, data));
         }
     }
     /// Single-JPEG-region frames (snapshot mode) yield the JPEG verbatim;
@@ -587,15 +688,23 @@ impl FrameAssembler {
         let rects: Vec<(Rect, bytes::Bytes)> = self
             .regions
             .iter()
-            .map(|(_, r, d)| (*r, d.clone()))
+            .map(|(_, _, r, d)| (*r, d.clone()))
             .collect();
+        // A frame whose regions come from more than one surface cannot be
+        // composed into the single canvas, so it is not "a surface" at all.
+        let surfaces: Vec<u16> = self.regions.iter().map(|(s, _, _, _)| *s).collect();
+        let surface_id = if surfaces.iter().all(|s| *s == surfaces[0]) {
+            surfaces.first().copied()
+        } else {
+            None
+        };
         let (codec_id, data) = if self.regions.len() == 1 {
-            let (c, _, d) = self.regions.pop().unwrap();
+            let (_, c, _, d) = self.regions.pop().unwrap();
             (c, d)
         } else {
             let mut blob = bytes::BytesMut::new();
             let mut codec = RDPGFX_CODECID_UNCOMPRESSED;
-            for (c, r, d) in self.regions.drain(..) {
+            for (_, c, r, d) in self.regions.drain(..) {
                 codec = c;
                 blob.extend_from_slice(&r.left.to_le_bytes());
                 blob.extend_from_slice(&r.top.to_le_bytes());
@@ -606,7 +715,12 @@ impl FrameAssembler {
             }
             (codec, blob.freeze())
         };
-        Some(PendingFrame { codec_id, data, rects })
+        Some(PendingFrame {
+            codec_id,
+            data,
+            rects,
+            surface_id,
+        })
     }
 }
 
