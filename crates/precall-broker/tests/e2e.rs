@@ -183,14 +183,14 @@ async fn dirty_rect_frames_are_composed_into_a_full_frame_archive() {
         meta: sample_meta(2, "dirty-2"),
     };
     session.send_dirty_regions(&regions, &dirty.meta).await.unwrap();
-    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    let client_dir = dir.path().join(client_id.to_string());
+    let landed = wait_for_captures(&client_dir.join("ukg.db"), 2).await;
     session.close().await.unwrap();
     handle.abort();
+    assert_eq!(landed, 2, "both captures landed");
 
-    let client_dir = dir.path().join(client_id.to_string());
     let ukg = Ukg::open(&client_dir.join("ukg.db")).unwrap();
     let timeline = ukg.timeline(None, 10).unwrap();
-    assert_eq!(timeline.len(), 2, "both captures landed");
 
     let key = load_or_create_key(dir.path()).unwrap();
     let objects = ObjectStore::encrypted(client_dir.join("objects"), key).unwrap();
@@ -256,14 +256,14 @@ async fn dirty_rects_without_a_keyframe_stay_an_honest_blob() {
         meta: sample_meta(1, "orphan-1"),
     };
     session.send_dirty_regions(&regions, &frame.meta).await.unwrap();
-    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    let client_dir = dir.path().join(client_id.to_string());
+    let landed = wait_for_captures(&client_dir.join("ukg.db"), 1).await;
     session.close().await.unwrap();
     handle.abort();
+    assert_eq!(landed, 1);
 
-    let client_dir = dir.path().join(client_id.to_string());
     let ukg = Ukg::open(&client_dir.join("ukg.db")).unwrap();
     let timeline = ukg.timeline(None, 10).unwrap();
-    assert_eq!(timeline.len(), 1);
     let token = ukg.image_token(timeline[0].id).unwrap().unwrap();
     let ts = timeline[0].timestamp_100ns;
     let (y, m, d) = precall_broker::filetime_to_ymd(ts);
@@ -282,6 +282,28 @@ async fn dirty_rects_without_a_keyframe_stay_an_honest_blob() {
         !objects.exists(&base.join(format!("{token}.jpg"))),
         "a concatenation must never be labelled .jpg"
     );
+}
+
+/// Wait for `count` captures to land in a client's database.
+///
+/// Polling beats a fixed sleep: composition now runs on the blocking pool, and a
+/// fixed 300 ms was already marginal on a slower runner — the failure was a
+/// flake in the test, not in the broker.
+async fn wait_for_captures(db: &std::path::Path, count: usize) -> usize {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let mut landed = 0usize;
+    while std::time::Instant::now() < deadline {
+        landed = Ukg::open(db)
+            .ok()
+            .and_then(|u| u.timeline(None, 64).ok())
+            .map(|t| t.len())
+            .unwrap_or(0);
+        if landed >= count {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    landed
 }
 
 /// Deterministic solid-colour JPEG, for asserting composed pixels.
@@ -337,14 +359,14 @@ async fn a_single_rectangle_delta_composes_onto_the_surface() {
         meta: sample_meta(2, "one-rect-2"),
     };
     session.send_dirty_regions(&regions, &dirty.meta).await.unwrap();
-    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    let client_dir = dir.path().join(client_id.to_string());
+    let landed = wait_for_captures(&client_dir.join("ukg.db"), 2).await;
     session.close().await.unwrap();
     handle.abort();
+    assert_eq!(landed, 2, "the keyframe and the delta both landed");
 
-    let client_dir = dir.path().join(client_id.to_string());
     let ukg = Ukg::open(&client_dir.join("ukg.db")).unwrap();
     let timeline = ukg.timeline(None, 10).unwrap();
-    assert_eq!(timeline.len(), 2);
     let token = ukg.image_token(timeline[0].id).unwrap().unwrap();
     assert_eq!(token, "one-rect-2");
     let ts = timeline[0].timestamp_100ns;
@@ -445,19 +467,7 @@ async fn composing_a_delta_does_not_block_the_runtime_worker() {
     // Wait for the compose to land rather than guessing a duration: on one
     // worker everything (the 1080p encode, the test's own awaits) shares a
     // thread, so a fixed sleep would be the flakiest part of this test.
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-    let mut landed = 0usize;
-    while std::time::Instant::now() < deadline {
-        landed = Ukg::open(&dir.path().join(client_id.to_string()).join("ukg.db"))
-            .ok()
-            .and_then(|u| u.timeline(None, 10).ok())
-            .map(|t| t.len())
-            .unwrap_or(0);
-        if landed >= 2 {
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-    }
+    let landed = wait_for_captures(&dir.path().join(client_id.to_string()).join("ukg.db"), 2).await;
     probe.abort();
     assert_eq!(landed, 2, "the delta reached the store");
 
