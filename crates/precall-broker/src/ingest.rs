@@ -347,16 +347,20 @@ impl Broker {
                 // route, image embedder, timeline, export — keeps seeing one
                 // full-frame image per capture, exactly as Recall's own store
                 // does. (RDPEGFX composes into a surface the same way.)
-                // A frame from another surface would corrupt the one canvas we
-                // keep; store the blob and say why.
-                if f.surface_id.is_some_and(|s| s != store.primary_surface) {
+                // Exactly the advertised surface composes. `None` means the
+                // frame's regions span several surfaces, which cannot go into one
+                // canvas either — comparing the Option rather than the inner
+                // value keeps both cases out.
+                let composes = f.surface_id == Some(store.primary_surface);
+                if !composes {
                     warn!(
                         client = %client_id,
                         surface = ?f.surface_id,
-                        "frame from a surface other than the advertised one; storing the region blob"
+                        primary = store.primary_surface,
+                        "frame is not wholly from the advertised surface; storing the region blob"
                     );
                 }
-                let payload: Option<(&str, bytes::Bytes)> = if f.surface_id.is_some_and(|s| s != store.primary_surface) {
+                let payload: Option<(&str, bytes::Bytes)> = if !composes {
                     Some(("raw", f.data.clone()))
                 } else if is_full_surface(&f, store.display) {
                     // A keyframe: archive it verbatim, and keep the surface
@@ -372,7 +376,19 @@ impl Broker {
                             record_compose_thread();
                             match crate::canvas::Canvas::from_jpeg(&data) {
                                 Ok(c) => *canvas.lock().unwrap() = Some(c),
-                                Err(e) => warn!(client = %cid_log, "keyframe not decodable: {e}"),
+                                Err(e) => {
+                                    // Do not keep the old surface: the client's
+                                    // later deltas are relative to *this* frame,
+                                    // so composing them onto an older one would
+                                    // leave every area it changed permanently
+                                    // stale. Without a surface they are stored as
+                                    // blobs until a keyframe that decodes.
+                                    *canvas.lock().unwrap() = None;
+                                    warn!(
+                                        client = %cid_log,
+                                        "keyframe not decodable, surface invalidated: {e}"
+                                    );
+                                }
                             }
                         })
                         .await;

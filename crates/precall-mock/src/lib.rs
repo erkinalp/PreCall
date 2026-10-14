@@ -182,9 +182,36 @@ impl Session {
     ///
     /// `regions` are `(rect, jpeg)` pairs; each is the encoded content of that
     /// rectangle only.
+    /// Send regions on explicit surface ids — several surfaces in one frame is
+    /// the shape the broker must refuse rather than compose.
+    pub async fn send_regions_mixed(
+        &mut self,
+        regions: &[(u16, Rect, Vec<u8>)],
+        meta: &WindowCaptureRecord,
+    ) -> Result<(), anyhow::Error> {
+        let regions: Vec<(u16, Rect, bytes::Bytes)> = regions
+            .iter()
+            .map(|(s, r, d)| (*s, *r, bytes::Bytes::copy_from_slice(d)))
+            .collect();
+        self.send_regions_inner(&regions, meta).await
+    }
+
     pub async fn send_dirty_regions(
         &mut self,
         regions: &[(Rect, Vec<u8>)],
+        meta: &WindowCaptureRecord,
+    ) -> Result<(), anyhow::Error> {
+        let regions: Vec<(u16, Rect, bytes::Bytes)> = regions
+            .iter()
+            .map(|(r, d)| (0u16, *r, bytes::Bytes::copy_from_slice(d)))
+            .collect();
+        self.send_regions_inner(&regions, meta).await
+    }
+
+    /// One START/END pair carrying `regions`, each on its given surface.
+    async fn send_regions_inner(
+        &mut self,
+        regions: &[(u16, Rect, bytes::Bytes)],
         meta: &WindowCaptureRecord,
     ) -> Result<(), anyhow::Error> {
         self.frame_id += 1;
@@ -194,13 +221,13 @@ impl Session {
             timestamp: (meta.timestamp_100ns & 0xFFFF_FFFF) as u32,
         }
         .encode(&mut gfx);
-        for (rect, jpeg) in regions {
+        for (surface_id, rect, jpeg) in regions {
             GfxPdu::WireToSurface1 {
-                surface_id: 0,
+                surface_id: *surface_id,
                 codec_id: RDPGFX_CODECID_JPEG,
                 pixel_format: RDPGFX_PIXEL_FORMAT_XRGB_8888,
                 dest_rect: *rect,
-                bitmap_data: bytes::Bytes::copy_from_slice(jpeg),
+                bitmap_data: jpeg.clone(),
             }
             .encode(&mut gfx);
         }

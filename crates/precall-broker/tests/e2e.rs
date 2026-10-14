@@ -652,3 +652,143 @@ async fn a_negative_rectangle_is_not_a_keyframe() {
         "the archive stays the desktop, not the patch"
     );
 }
+
+/// A frame whose regions span several surfaces has no single surface, so it
+/// cannot go into the one canvas the broker keeps for a client — and the `None`
+/// that marks it must not be mistaken for "the primary surface".
+#[tokio::test]
+async fn a_frame_from_two_surfaces_is_not_composed() {
+    let dir = tempfile::tempdir().unwrap();
+    let (certs, key, fingerprint) = test_cert();
+    let tls_cfg = tls::server_config_from(certs, key).unwrap();
+    let broker = Arc::new(Broker::new(config(dir.path()), tls_cfg).unwrap());
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let b = Arc::clone(&broker);
+    let handle = tokio::spawn(async move { b.run_on(listener).await });
+
+    let client_id = Uuid::new_v4();
+    let tls = pinned_client_config(&fingerprint).unwrap();
+    let mut session = Session::connect(
+        addr,
+        "localhost",
+        tls,
+        AuthMethod::Psk { token: PSK.into() },
+        client_id,
+        "MIXED",
+    )
+    .await
+    .expect("handshake");
+
+    let base = SyntheticFrame {
+        jpeg: solid_jpeg(1280, 720, [255, 255, 255]),
+        meta: sample_meta(1, "base-1"),
+    };
+    session.send_capture(&base).await.unwrap();
+    let db = dir.path().join(client_id.to_string()).join("ukg.db");
+    assert_eq!(wait_for_captures(&db, 1).await, 1);
+
+    // Region on the advertised surface (0, in the mock's hello) and one on
+    // another surface, in the same frame.
+    let mixed = vec![
+        (0u16, Rect::new(0, 0, 100, 100), solid_jpeg(100, 100, [255, 0, 0])),
+        (7u16, Rect::new(200, 0, 300, 100), solid_jpeg(100, 100, [0, 255, 0])),
+    ];
+    let frame = SyntheticFrame { jpeg: vec![], meta: sample_meta(2, "mixed-2") };
+    session.send_regions_mixed(&mixed, &frame.meta).await.unwrap();
+    assert_eq!(wait_for_captures(&db, 2).await, 2);
+    session.close().await.unwrap();
+    handle.abort();
+
+    let client_dir = dir.path().join(client_id.to_string());
+    let ukg = Ukg::open(&db).unwrap();
+    let timeline = ukg.timeline(None, 10).unwrap();
+    let token = ukg.image_token(timeline[0].id).unwrap().unwrap();
+    let (y, m, d) = precall_broker::filetime_to_ymd(timeline[0].timestamp_100ns);
+    let base_rel = std::path::PathBuf::from(client_id.to_string())
+        .join(format!("{y:04}"))
+        .join(format!("{m:02}"))
+        .join(format!("{d:02}"));
+    let key = load_or_create_key(dir.path()).unwrap();
+    let objects = ObjectStore::encrypted(client_dir.join("objects"), key).unwrap();
+    assert!(
+        objects.exists(&base_rel.join(format!("{token}.raw"))),
+        "a mixed-surface frame is stored as a blob, never composed"
+    );
+    assert!(!objects.exists(&base_rel.join(format!("{token}.jpg"))));
+}
+
+/// A keyframe the decoder rejects must invalidate the surface: the client's later
+/// deltas are relative to *that* frame, so composing them onto an older surface
+/// would leave every area it changed permanently stale.
+#[tokio::test]
+async fn a_rejected_keyframe_invalidates_the_surface() {
+    let dir = tempfile::tempdir().unwrap();
+    let (certs, key, fingerprint) = test_cert();
+    let tls_cfg = tls::server_config_from(certs, key).unwrap();
+    let broker = Arc::new(Broker::new(config(dir.path()), tls_cfg).unwrap());
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let b = Arc::clone(&broker);
+    let handle = tokio::spawn(async move { b.run_on(listener).await });
+
+    let client_id = Uuid::new_v4();
+    let tls = pinned_client_config(&fingerprint).unwrap();
+    let mut session = Session::connect(
+        addr,
+        "localhost",
+        tls,
+        AuthMethod::Psk { token: PSK.into() },
+        client_id,
+        "REJECT",
+    )
+    .await
+    .expect("handshake");
+
+    let base = SyntheticFrame {
+        jpeg: solid_jpeg(1280, 720, [255, 255, 255]),
+        meta: sample_meta(1, "base-1"),
+    };
+    session.send_capture(&base).await.unwrap();
+    let db = dir.path().join(client_id.to_string()).join("ukg.db");
+    assert_eq!(wait_for_captures(&db, 1).await, 1);
+
+    // A delta establishes the surface from the keyframe.
+    let one = vec![(Rect::new(0, 0, 50, 50), solid_jpeg(50, 50, [1, 2, 3]))];
+    let frame = SyntheticFrame { jpeg: vec![], meta: sample_meta(2, "delta-2") };
+    session.send_dirty_regions(&one, &frame.meta).await.unwrap();
+    assert_eq!(wait_for_captures(&db, 2).await, 2);
+
+    // A full-surface keyframe whose bytes are not an image.
+    let broken = SyntheticFrame {
+        jpeg: b"this is not a JPEG".to_vec(),
+        meta: sample_meta(3, "broken-3"),
+    };
+    session.send_capture(&broken).await.unwrap();
+    assert_eq!(wait_for_captures(&db, 3).await, 3);
+
+    // The next delta must not be composed against a stale surface.
+    let two = vec![(Rect::new(600, 600, 650, 650), solid_jpeg(50, 50, [9, 9, 9]))];
+    let frame = SyntheticFrame { jpeg: vec![], meta: sample_meta(4, "delta-4") };
+    session.send_dirty_regions(&two, &frame.meta).await.unwrap();
+    assert_eq!(wait_for_captures(&db, 4).await, 4);
+    session.close().await.unwrap();
+    handle.abort();
+
+    let client_dir = dir.path().join(client_id.to_string());
+    let ukg = Ukg::open(&db).unwrap();
+    let timeline = ukg.timeline(None, 10).unwrap();
+    let token = ukg.image_token(timeline[0].id).unwrap().unwrap();
+    assert_eq!(token, "delta-4", "newest first");
+    let (y, m, d) = precall_broker::filetime_to_ymd(timeline[0].timestamp_100ns);
+    let rel = std::path::PathBuf::from(client_id.to_string())
+        .join(format!("{y:04}"))
+        .join(format!("{m:02}"))
+        .join(format!("{d:02}"));
+    let key = load_or_create_key(dir.path()).unwrap();
+    let objects = ObjectStore::encrypted(client_dir.join("objects"), key).unwrap();
+    assert!(
+        objects.exists(&rel.join(format!("{token}.raw"))),
+        "the delta after a rejected keyframe is a blob, not a composition onto a stale surface"
+    );
+}
