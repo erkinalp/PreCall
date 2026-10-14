@@ -100,12 +100,6 @@ pub async fn run(cfg: ClientConfig, mut stop: watch::Receiver<bool>) -> Result<(
 
     let mut backoff = std::time::Duration::from_millis(500);
     let mut counters = Counters::default();
-    // Fingerprint of the last frame *successfully transmitted* through the
-    // metadata-less path. `None` means "unknown" — which is what a
-    // metadata-backed send leaves behind, because no fingerprint was computed
-    // for it. Comparing against a stale value would skip a real desktop change
-    // (the broker showing a different frame than the hash describes).
-    let mut last_hash: Option<u64> = None;
     // How much of the slot's cumulative drop counter has already been reported.
     // It must outlive connections: the slot does, and resetting it would re-add
     // every historical overwrite to the next heartbeat.
@@ -176,10 +170,13 @@ pub async fn run(cfg: ClientConfig, mut stop: watch::Receiver<bool>) -> Result<(
         let mut hb_tick =
             tokio::time::interval(std::time::Duration::from_millis(conn.hello.heartbeat_interval_ms.max(5000) as u64));
         let mut latest_frame: Option<BridgedFrame> = None;
-        // The fingerprint describes the frame the *broker* holds, and this is a
-        // new session with no surface: never let the previous session's hash
-        // suppress the keyframe this one needs.
-        last_hash = None;
+        // Fingerprint of the last frame *successfully transmitted* through the
+        // metadata-less path, and only for *this* session: the broker's new
+        // session has no surface, so a previous session's hash must never
+        // suppress the keyframe this one needs. `None` means "unknown" — what a
+        // metadata-backed send leaves behind, since no fingerprint was computed
+        // for the frame the broker now holds.
+        let mut last_hash: Option<u64> = None;
         // Changes reported since the last capture we sent. DXGI reports them
         // relative to the previous *acquired* frame, so dropping any would apply
         // only the newest change to the server's surface and archive stale
@@ -204,10 +201,12 @@ pub async fn run(cfg: ClientConfig, mut stop: watch::Receiver<bool>) -> Result<(
                 let current = *geometry.lock().unwrap();
                 if current.generation != last_generation {
                     last_generation = current.generation;
+                    // The desktop was re-created: the surface is not a valid
+                    // base, and the forced keyframe is never deduplicated, so
+                    // the fingerprint needs no reset here (a send clears it).
                     force_keyframe = true;
                     pending_dirty = Some(Vec::new());
                     pending_moved = false;
-                    last_hash = None;
                 }
                 if current.width > 0 && (current.width, current.height) != advertised {
                     tracing::info!(
