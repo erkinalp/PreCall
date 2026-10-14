@@ -17,7 +17,7 @@ use windows::Win32::Graphics::Dxgi::Common::{
 };
 use windows::Win32::Foundation::RECT;
 use windows::Win32::Graphics::Dxgi::{
-    CreateDXGIFactory1, IDXGIAdapter1, IDXGIFactory1, IDXGIOutput1,
+    CreateDXGIFactory1, IDXGIAdapter1, IDXGIFactory1, IDXGIOutput, IDXGIOutput1,
     IDXGIOutputDuplication, IDXGIResource, DXGI_ERROR_WAIT_TIMEOUT, DXGI_OUTDUPL_FRAME_INFO,
     DXGI_OUTDUPL_MOVE_RECT,
 };
@@ -65,28 +65,34 @@ pub struct Duplicator {
     height: u32,
 }
 
+/// The adapter and output the capture path would pick.
+///
+/// Adapter 0 is *not* assumed to have an output — a machine whose primary
+/// adapter drives no display is ordinary — so this walks adapters exactly as
+/// capture does. Anything that needs the desktop size must use this too, or it
+/// can disagree with the duplicator we actually capture from.
+unsafe fn select_output(
+    factory: &IDXGIFactory1,
+    output_index: u32,
+) -> Option<(IDXGIAdapter1, IDXGIOutput)> {
+    for i in 0.. {
+        match factory.EnumAdapters1(i) {
+            Ok(a) => {
+                if let Ok(o) = a.EnumOutputs(output_index) {
+                    return Some((a, o));
+                }
+            }
+            Err(_) => break,
+        }
+    }
+    None
+}
+
 impl Duplicator {
     pub fn new(output_index: u32) -> Result<Self, ClientError> {
         unsafe {
             let factory: IDXGIFactory1 = CreateDXGIFactory1()?;
-            let mut adapter: Option<IDXGIAdapter1> = None;
-            let mut output = None;
-            for i in 0.. {
-                match factory.EnumAdapters1(i) {
-                    Ok(a) => {
-                        if let Ok(o) = a.EnumOutputs(output_index) {
-                            adapter = Some(a);
-                            output = Some(o);
-                            break;
-                        }
-                    }
-                    Err(_) => break,
-                }
-            }
-            let adapter = adapter.ok_or_else(|| {
-                ClientError::Config("no DXGI adapter found".into())
-            })?;
-            let output = output.ok_or_else(|| {
+            let (adapter, output) = select_output(&factory, output_index).ok_or_else(|| {
                 ClientError::Config(format!("no DXGI output #{output_index}"))
             })?;
             let desc = output.GetDesc()?;
@@ -251,22 +257,38 @@ impl Duplicator {
     }
 }
 
-/// Size of the primary output, for the hello.
+/// Size of the output the capture path will use, for the hello.
 ///
 /// The broker needs it to tell a full-frame keyframe from a single-rectangle
-/// delta; without it a small edit looks like a keyframe and would be archived
-/// as the capture.
+/// delta; without it a small edit looks like a keyframe and would be archived as
+/// the capture. It walks adapters rather than assuming adapter 0 has the display.
 pub fn primary_output_size() -> Result<(u32, u32), ClientError> {
     unsafe {
         let factory: IDXGIFactory1 = CreateDXGIFactory1()?;
-        let adapter: IDXGIAdapter1 = factory.EnumAdapters1(0)?;
-        let output = adapter.EnumOutputs(0)?;
+        let (_, output) = select_output(&factory, 0)
+            .ok_or_else(|| ClientError::Config("no DXGI output".into()))?;
         let desc = output.GetDesc()?;
         let w = (desc.DesktopCoordinates.right as i64 - desc.DesktopCoordinates.left as i64).max(0);
         let h = (desc.DesktopCoordinates.bottom as i64 - desc.DesktopCoordinates.top as i64).max(0);
         Ok((w as u32, h as u32))
     }
 }
+
+/// What the capture thread sees right now: the desktop size, and a generation
+/// counter that advances whenever the duplicator is created or re-created.
+///
+/// A display mode change destroys and re-creates the duplicator; the broker's
+/// surface geometry came from the hello, so it must be told (a reconnect) or its
+/// canvas keeps the old size and misclassifies frames. The generation also tells
+/// the send loop that the desktop restarted, which is worth a keyframe.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct CaptureGeometry {
+    pub width: u32,
+    pub height: u32,
+    pub generation: u64,
+}
+
+pub type SharedGeometry = Arc<std::sync::Mutex<CaptureGeometry>>;
 
 /// Spawn the capture thread.
 ///
@@ -280,12 +302,20 @@ pub fn primary_output_size() -> Result<(u32, u32), ClientError> {
 pub fn spawn_capture(
     output_index: u32,
     on_error: impl Fn(ClientError) + Send + 'static,
-) -> Arc<ChangeSlot<CaptureFrame>> {
+) -> (Arc<ChangeSlot<CaptureFrame>>, SharedGeometry) {
     let slot = Arc::new(ChangeSlot::new());
     let producer = Arc::clone(&slot);
+    let geometry: SharedGeometry = Arc::new(std::sync::Mutex::new(CaptureGeometry::default()));
+    let geom = Arc::clone(&geometry);
     std::thread::Builder::new()
         .name("precall-dxgi".into())
         .spawn(move || {
+            let publish_geometry = |dup: &Duplicator| {
+                let mut g = geom.lock().unwrap();
+                g.width = dup.width;
+                g.height = dup.height;
+                g.generation += 1;
+            };
             let mut dup = match Duplicator::new(output_index) {
                 Ok(d) => d,
                 Err(e) => {
@@ -294,6 +324,7 @@ pub fn spawn_capture(
                     return;
                 }
             };
+            publish_geometry(&dup);
             loop {
                 match dup.next_frame(100) {
                     Ok(Some(f)) => producer.publish(f),
@@ -304,6 +335,10 @@ pub fn spawn_capture(
                         match Duplicator::new(output_index) {
                             Ok(d) => {
                                 dup = d;
+                                // New duplicator: the desktop may have moved to a
+                                // different size (mode change) and its contents
+                                // are not comparable with the previous surface.
+                                publish_geometry(&dup);
                             }
                             Err(e2) => {
                                 on_error(e2);
@@ -319,5 +354,5 @@ pub fn spawn_capture(
             }
         })
         .expect("spawn precall-dxgi");
-    slot
+    (slot, geometry)
 }

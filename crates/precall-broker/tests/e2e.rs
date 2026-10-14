@@ -376,3 +376,116 @@ async fn a_single_rectangle_delta_composes_onto_the_surface() {
         "and outside the patch too"
     );
 }
+
+/// Composing a dirty frame costs a full-desktop JPEG encode (~45 ms at 1080p).
+/// If that ran on the session's own runtime worker, a handful of dirty-rectangle
+/// clients would starve socket reads and heartbeats for *healthy* sessions too.
+///
+/// This pins the offload with a liveness probe on a **single-worker** runtime:
+/// the probe measures the largest gap between its own 5 ms ticks while a delta is
+/// composed. Synchronous composition would show up as a gap of at least one
+/// encode; offloaded composition leaves the worker free, so the gaps stay near
+/// the tick period.
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn composing_a_delta_does_not_block_the_runtime_worker() {
+    let dir = tempfile::tempdir().unwrap();
+    let (certs, key, fingerprint) = test_cert();
+    let tls_cfg = tls::server_config_from(certs, key).unwrap();
+    let broker = Arc::new(Broker::new(config(dir.path()), tls_cfg).unwrap());
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let b = Arc::clone(&broker);
+    let handle = tokio::spawn(async move { b.run_on(listener).await });
+
+    let client_id = Uuid::new_v4();
+    let tls = pinned_client_config(&fingerprint).unwrap();
+    let mut session = Session::connect(
+        addr,
+        "localhost",
+        tls,
+        AuthMethod::Psk { token: PSK.into() },
+        client_id,
+        "LIVENESS",
+    )
+    .await
+    .expect("handshake");
+
+    // A 1080p keyframe gives the compositor a 1080p surface to encode from.
+    let base = SyntheticFrame {
+        jpeg: solid_jpeg(1920, 1080, [255, 255, 255]),
+        meta: sample_meta(1, "base-1"),
+    };
+    session.send_capture(&base).await.unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+
+    // Probe: the largest gap between consecutive 5 ms ticks.
+    let worst_gap_ms = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let probe = {
+        let worst = Arc::clone(&worst_gap_ms);
+        tokio::spawn(async move {
+            let mut iv = tokio::time::interval(std::time::Duration::from_millis(5));
+            let mut last = std::time::Instant::now();
+            loop {
+                iv.tick().await;
+                let now = std::time::Instant::now();
+                let gap = now.duration_since(last).as_millis() as u64;
+                last = now;
+                worst.fetch_max(gap, std::sync::atomic::Ordering::Relaxed);
+            }
+        })
+    };
+
+    // One delta: this is what triggers the 1080p compose + encode.
+    let regions = vec![(Rect::new(100, 100, 300, 200), solid_jpeg(200, 100, [255, 0, 0]))];
+    let dirty = SyntheticFrame {
+        jpeg: vec![],
+        meta: sample_meta(2, "delta-2"),
+    };
+    session.send_dirty_regions(&regions, &dirty.meta).await.unwrap();
+    // Wait for the compose to land rather than guessing a duration: on one
+    // worker everything (the 1080p encode, the test's own awaits) shares a
+    // thread, so a fixed sleep would be the flakiest part of this test.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let mut landed = 0usize;
+    while std::time::Instant::now() < deadline {
+        landed = Ukg::open(&dir.path().join(client_id.to_string()).join("ukg.db"))
+            .ok()
+            .and_then(|u| u.timeline(None, 10).ok())
+            .map(|t| t.len())
+            .unwrap_or(0);
+        if landed >= 2 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    probe.abort();
+    assert_eq!(landed, 2, "the delta reached the store");
+
+    // Confirm the delta was actually composed (otherwise this proves nothing).
+    let client_dir = dir.path().join(client_id.to_string());
+    let ukg = Ukg::open(&client_dir.join("ukg.db")).unwrap();
+    let timeline = ukg.timeline(None, 10).unwrap();
+    assert_eq!(timeline.len(), 2, "the delta reached the store");
+    let token = ukg.image_token(timeline[0].id).unwrap().unwrap();
+    let ts = timeline[0].timestamp_100ns;
+    let (y, m, d) = precall_broker::filetime_to_ymd(ts);
+    let key = load_or_create_key(dir.path()).unwrap();
+    let objects = ObjectStore::encrypted(client_dir.join("objects"), key).unwrap();
+    let rel = std::path::PathBuf::from(client_id.to_string())
+        .join(format!("{y:04}"))
+        .join(format!("{m:02}"))
+        .join(format!("{d:02}"))
+        .join(format!("{token}.jpg"));
+    let bytes = objects.get(&client_id.to_string(), &rel, &token).unwrap();
+    let img = image::load_from_memory(&bytes).unwrap();
+    assert_eq!((img.width(), img.height()), (1920, 1080));
+    handle.abort();
+
+    let worst = worst_gap_ms.load(std::sync::atomic::Ordering::Relaxed);
+    // The trap: on one worker, a synchronous compose would hold the runtime for
+    // the whole encode (~45 ms measured for this frame size).
+    assert!(
+        worst < 35,
+        "a {worst} ms gap between runtime ticks means composition blocked the worker"
+    );
+}

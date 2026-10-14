@@ -68,7 +68,7 @@ pub async fn run(cfg: ClientConfig, mut stop: watch::Receiver<bool>) -> Result<(
     // Capture + audio threads live for the whole run. Frames do **not** buffer:
     // the capture thread overwrites a single slot, so a slow pipeline drops
     // frames instead of accumulating a backlog (and a desktop from minutes ago).
-    let mut frames = spawn_capture(0, |e| tracing::warn!("capture thread: {e}"));
+    let (mut frames, mut geometry) = spawn_capture(0, |e| tracing::warn!("capture thread: {e}"));
     let audio_rx = if cfg.enable_audio {
         Some(spawn_loopback(audio_stop.clone()))
     } else {
@@ -110,6 +110,11 @@ pub async fn run(cfg: ClientConfig, mut stop: watch::Receiver<bool>) -> Result<(
     // It must outlive connections: the slot does, and resetting it would re-add
     // every historical overwrite to the next heartbeat.
     let mut slot_drops_reported = 0u64;
+    // Generation of the duplicator the surface was built from, and the size the
+    // broker was told about. A display mode change re-creates the duplicator, and
+    // the broker's surface must be rebuilt at the new size.
+    let mut last_generation = 0u64;
+    let mut advertised: (u32, u32) = (0, 0);
 
     loop {
         if *stop.borrow() {
@@ -120,8 +125,11 @@ pub async fn run(cfg: ClientConfig, mut stop: watch::Receiver<bool>) -> Result<(
         // reconnecting and heartbeating while capturing nothing at all.
         if frames.is_closed() {
             tracing::warn!("capture worker gone; restarting it");
-            frames = spawn_capture(0, |e| tracing::warn!("capture thread: {e}"));
+            let (new_frames, new_geometry) = spawn_capture(0, |e| tracing::warn!("capture thread: {e}"));
+            frames = new_frames;
+            geometry = new_geometry;
             frame_chan = frame_bridge(&frames);
+            last_generation = 0;
             // The new slot's drop counter starts at zero: keeping the old
             // baseline would subtract an unrelated count and hide this worker's
             // early drops (hundreds during a reconnect backoff).
@@ -129,8 +137,17 @@ pub async fn run(cfg: ClientConfig, mut stop: watch::Receiver<bool>) -> Result<(
         }
         // The broker composes dirty rectangles against this size, so it must be
         // the real desktop, not zero (which used to make every single-rectangle
-        // delta look like a keyframe).
-        let display = crate::dxgi::primary_output_size().unwrap_or((0, 0));
+        // delta look like a keyframe). Prefer what the capture thread actually
+        // selected: it scans adapters, so it can find a display that a
+        // first-adapter query would miss.
+        let capture_geometry = *geometry.lock().unwrap();
+        let display = if capture_geometry.width > 0 {
+            (capture_geometry.width, capture_geometry.height)
+        } else {
+            crate::dxgi::primary_output_size().unwrap_or((0, 0))
+        };
+        advertised = display;
+        last_generation = capture_geometry.generation;
         let conn = match Connection::connect(&cfg, display).await {
             Ok(c) => {
                 backoff = std::time::Duration::from_millis(500);
@@ -173,6 +190,28 @@ pub async fn run(cfg: ClientConfig, mut stop: watch::Receiver<bool>) -> Result<(
         let mut pending: std::collections::VecDeque<u64> = std::collections::VecDeque::new();
 
         loop {
+            // The desktop can be re-created under us (a display mode change
+            // destroys DXGI duplication). A new generation means the previous
+            // surface is not a valid base for a delta, so the next frame goes
+            // whole; a size change means the broker's canvas is the wrong shape,
+            // which only a fresh handshake can fix.
+            {
+                let current = *geometry.lock().unwrap();
+                if current.generation != last_generation {
+                    last_generation = current.generation;
+                    force_keyframe = true;
+                    pending_dirty = Some(Vec::new());
+                    pending_moved = false;
+                    last_hash = None;
+                }
+                if current.width > 0 && (current.width, current.height) != advertised {
+                    tracing::info!(
+                        "display is now {}x{} (was {}x{}); re-handshaking so the broker rebuilds its surface",
+                        current.width, current.height, advertised.0, advertised.1
+                    );
+                    break;
+                }
+            }
             tokio::select! {
                 _ = stop.changed() => break,
                 f = frame_chan.recv() => {

@@ -214,7 +214,9 @@ impl Broker {
                     last_seen = std::time::Instant::now();
                     match frame.channel {
                         ChannelId::GfxRdp => self.handle_gfx(&hello.client_id, &frame.payload, &mut frames, &mut pending)?,
-                        ChannelId::PcMeta => self.handle_meta(&hello.client_id, &frame.payload, &store, &mut pending)?,
+                        ChannelId::PcMeta => self
+                            .handle_meta(&hello.client_id, &frame.payload, &mut store, &mut pending)
+                            .await?,
                         ChannelId::PcAudio => self.handle_audio(&hello.client_id, &frame.payload, &store)?,
                         ChannelId::PcCtrl => self.handle_ctrl(&frame.payload)?,
                         ChannelId::PcQuery => warn!("client must not send on PCQUERY; dropping"),
@@ -274,11 +276,15 @@ impl Broker {
         Ok(())
     }
 
-    fn handle_meta(
+    async fn handle_meta(
         &self,
         client_id: &uuid::Uuid,
         payload: &[u8],
-        store: &ClientStore,
+        // `&mut` rather than `&`: `ClientStore` holds a rusqlite connection
+        // (`!Sync`), so a *shared* borrow held across an await would make the
+        // session future `!Send`. `&mut T` is `Send` whenever `T` is, which lets
+        // the offset composition run on the blocking pool.
+        store: &mut ClientStore,
         pending: &mut VecDeque<PendingFrame>,
     ) -> Result<(), BrokerError> {
         let batch: CaptureBatch = serde_json::from_slice(payload)?;
@@ -305,10 +311,19 @@ impl Broker {
                     // A keyframe: archive it verbatim, and keep the surface
                     // current from it when this client also sends rectangles.
                     if store.canvas.lock().unwrap().is_some() {
-                        match crate::canvas::Canvas::from_jpeg(&f.data) {
-                            Ok(c) => *store.canvas.lock().unwrap() = Some(c),
-                            Err(e) => warn!(client = %client_id, "keyframe not decodable: {e}"),
-                        }
+                        // Decoding a full frame is image work: it goes to the
+                        // blocking pool with the rest, never on the runtime
+                        // worker that serves this session's reads and timers.
+                        let canvas = std::sync::Arc::clone(&store.canvas);
+                        let data = f.data.clone();
+                        let cid_log = *client_id;
+                        let _ = tokio::task::spawn_blocking(move || {
+                            match crate::canvas::Canvas::from_jpeg(&data) {
+                                Ok(c) => *canvas.lock().unwrap() = Some(c),
+                                Err(e) => warn!(client = %cid_log, "keyframe not decodable: {e}"),
+                            }
+                        })
+                        .await;
                     }
                     Some(("jpg", f.data.clone()))
                 } else {
@@ -317,9 +332,35 @@ impl Broker {
                     // compositor answers `None` when there is no surface to
                     // seed or the codec cannot be composed, and then the region
                     // blob is stored honestly rather than as a corrupt image.
-                    match compose_dirty_rects(store, &cid, &f) {
-                        Some(jpeg) => Some(("jpg", jpeg)),
-                        None => Some(("raw", f.data.clone())),
+                    //
+                    // Seeding reads the previous capture (cheap, one row and one
+                    // object), then the decode/blit/encode runs on the blocking
+                    // pool: that encode is ~45 ms for a 1080p desktop, and doing
+                    // it here would block this connection's runtime worker, so
+                    // enough dirty-rectangle clients would starve socket reads
+                    // and heartbeats for healthy sessions too.
+                    // The object read is I/O and stays here; the *decode* of the
+                    // base image is image work and goes to the blocking pool
+                    // with the rectangles and the encode.
+                    let base = if store.canvas.lock().unwrap().is_none() {
+                        Self::last_capture_bytes(&*store, &cid)
+                    } else {
+                        None
+                    };
+                    let canvas = std::sync::Arc::clone(&store.canvas);
+                    let rects: Vec<(Rect, bytes::Bytes)> = f.rects.clone();
+                    let codec_id = f.codec_id;
+                    match tokio::task::spawn_blocking(move || {
+                        compose(canvas, codec_id, &rects, base)
+                    })
+                    .await
+                    {
+                        Ok(Some(jpeg)) => Some(("jpg", bytes::Bytes::from(jpeg))),
+                        Ok(None) => Some(("raw", f.data.clone())),
+                        Err(e) => {
+                            warn!("composition task failed: {e}");
+                            Some(("raw", f.data.clone()))
+                        }
                     }
                 };
 
@@ -339,37 +380,29 @@ impl Broker {
         Ok(())
     }
 
-    /// Apply a frame's dirty rectangles to the client's surface and encode the
-    /// result.
+    /// The archived bytes of the desktop as of the previous capture, for seeding
+    /// a surface that does not exist yet.
     ///
-    /// `None` means "cannot compose this frame" — no surface yet and no
-    /// keyframe to seed one from, a non-JPEG region codec, or a rectangle that
-    /// does not match its payload. The caller then stores the region blob as
-    /// `.raw` rather than pretending it is an image.
-    fn compose_frame(store: &ClientStore, frame: &PendingFrame) -> Option<bytes::Bytes> {
-        if frame.codec_id != RDPGFX_CODECID_JPEG {
-            warn!(
-                codec = codec_name(frame.codec_id),
-                "region codec cannot be composed; storing the blob"
-            );
+    /// Reading it here (rather than decoding every full frame up front) means a
+    /// client that only ever sends full frames never pays a decode at all: the
+    /// surface is built the moment it is needed.
+    fn last_capture_bytes(store: &ClientStore, client_id: &str) -> Option<bytes::Bytes> {
+        let entry = store.ukg.timeline(None, 1).ok()?.into_iter().next()?;
+        let token = store.ukg.image_token(entry.id).ok()??;
+        let rel = ObjectStore::key_path(
+            client_id,
+            filetime_to_ymd(entry.timestamp_100ns),
+            &token,
+            "jpg",
+        );
+        if !store.objects.exists(&rel) {
             return None;
         }
-        let mut guard = store.canvas.lock().unwrap();
-        let canvas = guard.as_mut()?;
-        for (rect, data) in &frame.rects {
-            if let Err(e) = canvas.apply_region(rect.left, rect.top, rect.right, rect.bottom, data)
-            {
-                warn!("region refused: {e}");
-                return None;
-            }
-        }
-        match canvas.encode_jpeg(COMPOSED_JPEG_QUALITY) {
-            Ok(jpeg) => Some(bytes::Bytes::from(jpeg)),
-            Err(e) => {
-                warn!("compose encode failed: {e}");
-                None
-            }
-        }
+        store
+            .objects
+            .get(client_id, &rel, &token)
+            .ok()
+            .map(bytes::Bytes::from)
     }
 
     /// PCAUDIO payload: `[u16 header_len][json {token}][opus bytes]`.
@@ -452,53 +485,58 @@ fn is_full_surface(frame: &PendingFrame, display: (u32, u32)) -> bool {
 /// Quality of the composed archive frame.
 const COMPOSED_JPEG_QUALITY: u8 = 85;
 
-/// Compose a dirty-rect frame, seeding the surface from the previous capture's
-/// archived image the first time a client sends rectangles.
+/// Apply rectangles to the client's surface and encode the result, on the
+/// blocking pool.
 ///
-/// Seeding from the *previous* capture (rather than decoding every full frame
-/// up front) means a client that only ever sends full frames never pays for a
-/// decode at all: the surface is built the moment it is needed.
-fn compose_dirty_rects(
-    store: &ClientStore,
-    client_id: &str,
-    frame: &PendingFrame,
-) -> Option<bytes::Bytes> {
-    if store.canvas.lock().unwrap().is_none() {
-        match canvas_from_last_capture(store, client_id) {
-            Some(canvas) => {
-                *store.canvas.lock().unwrap() = Some(canvas);
-                debug!(client_id, "surface seeded from the previous capture");
-            }
+/// `None` means "cannot compose this frame" — no surface (nothing to seed from),
+/// a codec that cannot be composed, or a rectangle that does not match its
+/// payload — and the caller then stores the region blob rather than pretending
+/// it is an image.
+fn compose(
+    canvas: std::sync::Arc<std::sync::Mutex<Option<crate::canvas::Canvas>>>,
+    codec_id: u16,
+    rects: &[(Rect, bytes::Bytes)],
+    base: Option<bytes::Bytes>,
+) -> Option<Vec<u8>> {
+    if codec_id != RDPGFX_CODECID_JPEG {
+        warn!(
+            codec = codec_name(codec_id),
+            "region codec cannot be composed; storing the blob"
+        );
+        return None;
+    }
+    let mut guard = canvas.lock().unwrap();
+    if guard.is_none() {
+        // No surface yet: build it from the previous capture's archive frame.
+        let base = match base {
+            Some(base) => base,
             None => {
-                warn!(
-                    client_id,
-                    "dirty rects before any full frame; storing the region blob"
-                );
+                debug!("dirty rects before any full frame; storing the region blob");
+                return None;
+            }
+        };
+        match crate::canvas::Canvas::from_jpeg(&base) {
+            Ok(seeded) => *guard = Some(seeded),
+            Err(e) => {
+                warn!("cannot seed the surface from the previous capture: {e}");
                 return None;
             }
         }
     }
-    Broker::compose_frame(store, frame)
-}
-
-/// Decode the desktop as of the previous archived capture.
-fn canvas_from_last_capture(
-    store: &ClientStore,
-    client_id: &str,
-) -> Option<crate::canvas::Canvas> {
-    let entry = store.ukg.timeline(None, 1).ok()?.into_iter().next()?;
-    let token = store.ukg.image_token(entry.id).ok()??;
-    let rel = ObjectStore::key_path(
-        client_id,
-        filetime_to_ymd(entry.timestamp_100ns),
-        &token,
-        "jpg",
-    );
-    if !store.objects.exists(&rel) {
-        return None;
+    let canvas = guard.as_mut()?;
+    for (rect, data) in rects {
+        if let Err(e) = canvas.apply_region(rect.left, rect.top, rect.right, rect.bottom, data) {
+            warn!("region refused: {e}");
+            return None;
+        }
     }
-    let bytes = store.objects.get(client_id, &rel, &token).ok()?;
-    crate::canvas::Canvas::from_jpeg(&bytes).ok()
+    match canvas.encode_jpeg(COMPOSED_JPEG_QUALITY) {
+        Ok(jpeg) => Some(jpeg),
+        Err(e) => {
+            warn!("compose encode failed: {e}");
+            None
+        }
+    }
 }
 
 /// One finished frame awaiting its metadata record.
