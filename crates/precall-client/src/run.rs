@@ -227,12 +227,24 @@ pub async fn run(cfg: ClientConfig, mut stop: watch::Receiver<bool>) -> Result<(
                 f = frame_chan.recv() => {
                     match f {
                         Some(fr) => {
+                            // Filtering here, not only at the transition: the
+                            // bridge may already have been blocked in
+                            // `blocking_send` with a frame from the previous
+                            // duplicator, which lands *after* the drain. Sending
+                            // it as the new generation's keyframe would leave every
+                            // later delta composed onto an obsolete desktop.
+                            if fr.0.generation != last_generation {
+                                continue;
+                            }
                             if let Some(prev) = latest_frame.replace(fr) {
                                 absorb(&mut pending_dirty, &mut pending_moved, prev);
                                 counters.frames_dropped += 1;
                             }
                             // Newest-only: anything already queued is older.
                             while let Ok(fr) = frame_chan.try_recv() {
+                                if fr.0.generation != last_generation {
+                                    continue;
+                                }
                                 if let Some(prev) = latest_frame.replace(fr) {
                                     absorb(&mut pending_dirty, &mut pending_moved, prev);
                                     counters.frames_dropped += 1;
@@ -596,6 +608,11 @@ fn frame_bridge(
         match slot.recv() {
             Some(f) => {
                 if tx.blocking_send(f).is_err() {
+                    // The send loop is gone (it stopped, or the process is
+                    // shutting down): close the slot so the capture thread
+                    // notices and exits instead of acquiring and copying
+                    // desktop frames for the rest of the process.
+                    slot.close();
                     return;
                 }
             }

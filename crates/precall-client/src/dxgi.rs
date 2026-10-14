@@ -338,6 +338,12 @@ pub fn spawn_capture(
             // what `-D unused-assignments` rejects.
             let mut generation = publish_geometry(&dup);
             loop {
+                // A closed slot means the send loop is gone: stop capturing
+                // rather than holding DXGI resources and a full frame for the
+                // rest of the process.
+                if producer.is_closed() {
+                    return;
+                }
                 match dup.next_frame(100) {
                     Ok(Some(mut f)) => {
                         f.generation = generation;

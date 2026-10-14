@@ -975,3 +975,34 @@ mod change_slot_bound_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod close_semantics_tests {
+    use super::*;
+
+    #[derive(Debug)]
+    struct F;
+
+    impl ChangeMeta for F {
+        fn take_changes(&mut self) -> (Option<Vec<Rect>>, bool) {
+            (Some(Vec::new()), false)
+        }
+    }
+
+    /// A captured producer must not keep working after its consumer is gone: a
+    /// closed slot is how the capture thread learns to stop (and why `publish`
+    /// must not resurrect it).
+    #[test]
+    fn a_closed_slot_refuses_further_frames_and_reports_it() {
+        let slot = ChangeSlot::new();
+        slot.publish(F);
+        assert_eq!(slot.published(), 1);
+        slot.close();
+        assert!(slot.is_closed());
+        slot.publish(F);
+        slot.publish(F);
+        assert_eq!(slot.published(), 1, "publishing into a closed slot is a no-op");
+        assert!(slot.recv().is_some(), "the resident frame is still handed out");
+        assert!(slot.recv().is_none(), "and then the consumer wakes with None");
+    }
+}

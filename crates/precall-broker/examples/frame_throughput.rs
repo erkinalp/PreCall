@@ -108,6 +108,28 @@ fn store_microbench(dir: &std::path::Path, frames: usize, jpeg: &[u8]) {
     );
 }
 
+/// Wait until `count` captures have landed in a client's database.
+///
+/// Polling, not sleeping: the benchmark is measuring commit latency, so it must
+/// observe the last commit rather than guess when it happened.
+async fn wait_for_rows(db: &std::path::Path, count: usize) -> usize {
+    let deadline = Instant::now() + Duration::from_secs(120);
+    let mut landed = 0usize;
+    while Instant::now() < deadline {
+        if let Ok(ukg) = Ukg::open(db) {
+            landed = ukg
+                .timeline(None, (count + 8) as i64)
+                .map(|t| t.len())
+                .unwrap_or(0);
+            if landed >= count {
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    landed
+}
+
 /// End-to-end: mock client → TLS → broker → objects + ukg.db.
 async fn end_to_end(dir: &std::path::Path, frames: usize, width: u32, height: u32, encrypt: bool) -> f64 {
     let (certs, key, fingerprint) = test_cert();
@@ -143,8 +165,19 @@ async fn end_to_end(dir: &std::path::Path, frames: usize, width: u32, height: u3
         .collect();
     let bytes: usize = encoded.iter().map(|f| f.jpeg.len()).sum();
 
-    // Warm-up: one frame through the whole path.
-    session.send_capture(&encoded[0]).await.unwrap();
+    let ukg_path = dir.join(client_id.to_string()).join("ukg.db");
+
+    // Warm-up: one frame through the whole path, with a **distinct token** so
+    // the row count is unambiguous. (It used to reuse `encoded[0]`, which shares
+    // that frame's row — so "wait for `frames` rows" silently depended on the
+    // coincidence, and a reader could reasonably have "fixed" it in the wrong
+    // direction.)
+    let warm_up = SyntheticFrame {
+        jpeg: synthesize_jpeg(width, height, u64::MAX),
+        meta: sample_meta(u64::MAX, "warmup"),
+    };
+    session.send_capture(&warm_up).await.unwrap();
+    assert_eq!(wait_for_rows(&ukg_path, 1).await, 1, "warm-up committed");
 
     let t0 = Instant::now();
     for f in &encoded {
@@ -152,19 +185,11 @@ async fn end_to_end(dir: &std::path::Path, frames: usize, width: u32, height: u3
     }
     let send = t0.elapsed();
 
-    // Wait for the last capture to land in the metadata DB.
-    let ukg_path = dir.join(client_id.to_string()).join("ukg.db");
-    let deadline = Instant::now() + Duration::from_secs(120);
-    let mut landed = 0usize;
-    while Instant::now() < deadline {
-        if let Ok(ukg) = Ukg::open(&ukg_path) {
-            landed = ukg.timeline(None, (frames + 8) as i64).map(|t| t.len()).unwrap_or(0);
-            if landed >= frames {
-                break;
-            }
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
+    // Wait for the last *timed* capture to land. The expected row count is
+    // exact: the warm-up has its own token and was waited for before the timer
+    // started, so rows = 1 (warm-up) + however many timed frames committed.
+    // Stopping one short would report a rate for work still in flight.
+    let landed = wait_for_rows(&ukg_path, 1 + frames).await;
     let total = t0.elapsed();
 
     handle.abort();
