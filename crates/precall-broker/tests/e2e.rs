@@ -908,3 +908,76 @@ async fn a_wrong_sized_keyframe_does_not_become_the_surface() {
         "the delta is a blob: the wrong-sized keyframe was not adopted as the surface"
     );
 }
+
+/// A syntactically valid frame with no regions must not panic the session (the
+/// keyframe test used to index an empty surface list), and it must not invalidate
+/// a healthy surface either — it carries nothing.
+#[tokio::test]
+async fn an_empty_frame_neither_panics_nor_invalidates() {
+    let dir = tempfile::tempdir().unwrap();
+    let (certs, key, fingerprint) = test_cert();
+    let tls_cfg = tls::server_config_from(certs, key).unwrap();
+    let broker = Arc::new(Broker::new(config(dir.path()), tls_cfg).unwrap());
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let b = Arc::clone(&broker);
+    let handle = tokio::spawn(async move { b.run_on(listener).await });
+
+    let client_id = Uuid::new_v4();
+    let tls = pinned_client_config(&fingerprint).unwrap();
+    let mut session = Session::connect(
+        addr,
+        "localhost",
+        tls,
+        AuthMethod::Psk { token: PSK.into() },
+        client_id,
+        "EMPTY",
+    )
+    .await
+    .expect("handshake");
+
+    let base = SyntheticFrame {
+        jpeg: solid_jpeg(1280, 720, [255, 255, 255]),
+        meta: sample_meta(1, "base-1"),
+    };
+    session.send_capture(&base).await.unwrap();
+    let db = dir.path().join(client_id.to_string()).join("ukg.db");
+    assert_eq!(wait_for_captures(&db, 1).await, 1);
+
+    // A delta establishes the surface.
+    let one = vec![(Rect::new(0, 0, 50, 50), solid_jpeg(50, 50, [1, 2, 3]))];
+    let frame = SyntheticFrame { jpeg: vec![], meta: sample_meta(2, "delta-2") };
+    session.send_dirty_regions(&one, &frame.meta).await.unwrap();
+    assert_eq!(wait_for_captures(&db, 2).await, 2);
+
+    // START/END with no WIRE_TO_SURFACE at all.
+    let empty = SyntheticFrame { jpeg: vec![], meta: sample_meta(3, "empty-3") };
+    session.send_regions_mixed(&[], &empty.meta).await.unwrap();
+    assert_eq!(wait_for_captures(&db, 3).await, 3);
+
+    // The next delta must still compose: the empty frame said nothing.
+    let two = vec![(Rect::new(700, 500, 750, 550), solid_jpeg(50, 50, [9, 9, 9]))];
+    let frame = SyntheticFrame { jpeg: vec![], meta: sample_meta(4, "delta-4") };
+    session.send_dirty_regions(&two, &frame.meta).await.unwrap();
+    assert_eq!(wait_for_captures(&db, 4).await, 4);
+    session.close().await.unwrap();
+    handle.abort();
+
+    let client_dir = dir.path().join(client_id.to_string());
+    let ukg = Ukg::open(&db).unwrap();
+    let timeline = ukg.timeline(None, 10).unwrap();
+    let token = ukg.image_token(timeline[0].id).unwrap().unwrap();
+    assert_eq!(token, "delta-4");
+    let (y, m, d) = precall_broker::filetime_to_ymd(timeline[0].timestamp_100ns);
+    let rel = std::path::PathBuf::from(client_id.to_string())
+        .join(format!("{y:04}"))
+        .join(format!("{m:02}"))
+        .join(format!("{d:02}"))
+        .join(format!("{token}.jpg"));
+    let key = load_or_create_key(dir.path()).unwrap();
+    let objects = ObjectStore::encrypted(client_dir.join("objects"), key).unwrap();
+    assert!(
+        objects.exists(&rel),
+        "the delta after an empty frame still composes (the surface was not invalidated)"
+    );
+}

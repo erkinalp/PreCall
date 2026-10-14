@@ -190,12 +190,12 @@ of 253 KiB — **50x less**):
 | path | wire per capture | server per capture | client per capture |
 |---|---|---|---|
 | full frames | 253 KiB | ~0.7 ms (stored verbatim) | 58 ms encode |
-| dirty rects | 5.1 KiB | **45.3 ms** (canvas compose + encode) | ~2 ms encode |
+| dirty rects | 5.1 KiB | **50 ms** (canvas compose + encode, 1080p) | ~2 ms encode |
 
 So dirty rectangles move the encode from the client to the server. At Recall's
-cadence that is 45 ms per three seconds — **1.5% of one core per client** — while
+cadence that is 50 ms per three seconds — **1.7% of one core per client** — while
 the client drops from 58 ms to a couple of milliseconds and the uplink from
-253 KiB to 5 KiB. At a 60 fps *stream* the server pays ~2.7 cores per client,
+253 KiB to 5 KiB. At a 60 fps *stream* the server pays ~3 cores per client,
 which is the case for a hardware encoder (Media Foundation on Windows; the
 measured figure is the software JPEG path). The knob that decides it is the
 capture cadence: `16` ms is streaming, `3000` ms is Recall, and the server's

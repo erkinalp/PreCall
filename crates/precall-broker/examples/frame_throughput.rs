@@ -240,13 +240,18 @@ async fn dirty_rect_throughput(
 
     let client_id = Uuid::new_v4();
     let tls = pinned_client_config(&fingerprint).unwrap();
-    let mut session = Session::connect(
+    // Advertise the size being benchmarked: the broker only adopts a keyframe
+    // whose image matches the advertised surface, so a mismatch would make every
+    // measured delta a blob and stop measuring composition at all.
+    let mut session = Session::connect_sized(
         addr,
         "localhost",
         tls,
         AuthMethod::Psk { token: PSK.to_string() },
         client_id,
         "DIRTYBENCH",
+        width,
+        height,
     )
     .await
     .expect("handshake");

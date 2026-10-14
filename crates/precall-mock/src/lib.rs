@@ -96,6 +96,11 @@ pub struct Session {
     pub client_id: Uuid,
     seq: u64,
     frame_id: u32,
+    /// The display geometry this session advertised. Full frames must be sent at
+    /// this size: the broker adopts a keyframe only when its image and rectangle
+    /// match the surface it was told about.
+    width: i16,
+    height: i16,
 }
 
 impl Session {
@@ -107,6 +112,24 @@ impl Session {
         auth: AuthMethod,
         client_id: Uuid,
         hostname: &str,
+    ) -> Result<Self, anyhow::Error> {
+        Self::connect_sized(addr, server_name, tls, auth, client_id, hostname, 1280, 720).await
+    }
+
+    /// Connect advertising a specific display size.
+    ///
+    /// The broker only adopts a keyframe whose image matches the advertised
+    /// surface, so a harness that captures at, say, 1920x1080 must say so.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn connect_sized(
+        addr: SocketAddr,
+        server_name: &str,
+        tls: std::sync::Arc<ClientConfig>,
+        auth: AuthMethod,
+        client_id: Uuid,
+        hostname: &str,
+        width: u32,
+        height: u32,
     ) -> Result<Self, anyhow::Error> {
         let stream = TcpStream::connect(addr).await?;
         let connector = TlsConnector::from(tls);
@@ -121,8 +144,8 @@ impl Session {
             capabilities: Capabilities {
                 displays: vec![DisplayInfo {
                     surface_id: 0,
-                    width: 1280,
-                    height: 720,
+                    width,
+                    height,
                     origin_x: 0,
                     origin_y: 0,
                 }],
@@ -140,6 +163,8 @@ impl Session {
             client_id,
             seq: 0,
             frame_id: 0,
+            width: width as i16,
+            height: height as i16,
         })
     }
 
@@ -156,7 +181,7 @@ impl Session {
             surface_id: 0,
             codec_id: RDPGFX_CODECID_JPEG,
             pixel_format: RDPGFX_PIXEL_FORMAT_XRGB_8888,
-            dest_rect: Rect::new(0, 0, 1280, 720),
+            dest_rect: Rect::new(0, 0, self.width, self.height),
             bitmap_data: bytes::Bytes::copy_from_slice(&f.jpeg),
         }
         .encode(&mut gfx);

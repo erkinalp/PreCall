@@ -367,7 +367,11 @@ impl Broker {
                 // canvas either — comparing the Option rather than the inner
                 // value keeps both cases out.
                 let composes = f.surface_id == Some(store.primary_surface);
-                if !composes {
+                // A frame with no regions carries nothing: store the (empty) blob
+                // to keep the frame↔metadata pairing, but do not invalidate a
+                // surface it says nothing about.
+                let empty = f.rects.is_empty();
+                if !composes && !empty {
                     // A refused frame may contain primary-surface updates that are
                     // now lost, so the surface is no longer a valid base.
                     store
@@ -380,6 +384,8 @@ impl Broker {
                         primary = store.primary_surface,
                         "frame is not wholly from the advertised surface; storing the region blob"
                     );
+                } else if empty {
+                    debug!(client = %client_id, "frame carries no regions");
                 }
                 let payload: Option<(&str, bytes::Bytes)> = if !composes {
                     Some(("raw", f.data.clone()))
@@ -798,10 +804,12 @@ impl FrameAssembler {
         // A frame whose regions come from more than one surface cannot be
         // composed into the single canvas, so it is not "a surface" at all.
         let surfaces: Vec<u16> = self.regions.iter().map(|(s, _, _, _)| *s).collect();
-        let surface_id = if surfaces.iter().all(|s| *s == surfaces[0]) {
-            surfaces.first().copied()
-        } else {
-            None
+        // `first()` rather than `surfaces[0]`: a syntactically valid START/END
+        // frame with no WIRE_TO_SURFACE at all has no surface, and indexing it
+        // would panic an authenticated client's session.
+        let surface_id = match surfaces.first() {
+            Some(first) if surfaces.iter().all(|s| s == first) => Some(*first),
+            _ => None,
         };
         let (codec_id, data) = if self.regions.len() == 1 {
             let (_, c, _, d) = self.regions.pop().unwrap();
