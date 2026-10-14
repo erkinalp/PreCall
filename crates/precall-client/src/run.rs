@@ -100,7 +100,12 @@ pub async fn run(cfg: ClientConfig, mut stop: watch::Receiver<bool>) -> Result<(
 
     let mut backoff = std::time::Duration::from_millis(500);
     let mut counters = Counters::default();
-    let mut last_hash = 0u64;
+    // Fingerprint of the last frame *successfully transmitted* through the
+    // metadata-less path. `None` means "unknown" — which is what a
+    // metadata-backed send leaves behind, because no fingerprint was computed
+    // for it. Comparing against a stale value would skip a real desktop change
+    // (the broker showing a different frame than the hash describes).
+    let mut last_hash: Option<u64> = None;
     // How much of the slot's cumulative drop counter has already been reported.
     // It must outlive connections: the slot does, and resetting it would re-add
     // every historical overwrite to the next heartbeat.
@@ -208,14 +213,20 @@ pub async fn run(cfg: ClientConfig, mut stop: watch::Receiver<bool>) -> Result<(
                     // metadata is unavailable: DXGI redelivers an identical
                     // desktop around mode changes, and a moved pointer changes
                     // metadata but no pixels.
-                    if pending_dirty.is_none() {
+                    // Computed only on the metadata-less path; recorded only
+                    // after the frame is actually sent (below), so a dropped
+                    // preparation cannot leave a hash for a frame the broker
+                    // never received.
+                    let fallback_hash = if pending_dirty.is_none() {
                         let hash = precall_frame::frame_fingerprint(&frame.bgra);
-                        if hash == last_hash {
+                        if last_hash == Some(hash) {
                             counters.frames_skipped_unchanged += 1;
                             continue;
                         }
-                        last_hash = hash;
-                    }
+                        Some(hash)
+                    } else {
+                        None
+                    };
 
                     // Everything below is per-capture CPU — 58 ms for a
                     // desktop-like 1080p frame and 117 ms for photographic
@@ -376,6 +387,9 @@ pub async fn run(cfg: ClientConfig, mut stop: watch::Receiver<bool>) -> Result<(
                         break;
                     }
                     counters.frames_sent += 1;
+                    // The broker now displays this frame: track its fingerprint
+                    // if we computed one, otherwise mark the value unknown.
+                    last_hash = fallback_hash;
                     // The surface is current as of this capture; from here the
                     // server holds a surface for this session.
                     pending_dirty = Some(Vec::new());

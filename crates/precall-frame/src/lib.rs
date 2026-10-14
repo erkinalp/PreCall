@@ -73,42 +73,20 @@ impl<T> LatestSlot<T> {
 
     /// Publish a frame, replacing (and counting) any frame the consumer has not
     /// taken yet.
+    /// Publish a frame, replacing (and counting) any frame the consumer has not
+    /// taken yet.
     pub fn publish(&self, frame: T) {
-        self.publish_with(frame, |_| {});
-    }
-
-    /// Publish a frame, handing any displaced frame to `on_displaced` **inside
-    /// the critical section**.
-    ///
-    /// The displaced frame is gone from the slot, so a caller whose frames carry
-    /// change metadata ([`ChangeSlot`]) must fold that metadata into the next
-    /// handoff instead of letting it vanish. The callback runs while the slot
-    /// lock is held, which is what makes the replacement and the metadata
-    /// transfer atomic *from the consumer's perspective*: no consumer can take
-    /// the replacement before the displaced frame's metadata has been recorded,
-    /// so the metadata can never be left waiting for a later frame that may
-    /// never arrive (the desktop's last change, then silence).
-    pub fn publish_with(&self, frame: T, on_displaced: impl FnOnce(T)) {
         if self.is_closed() {
             return;
         }
-        // The callback runs **while the slot lock is held**, so a consumer
-        // cannot take the replacement until the displaced frame has been dealt
-        // with. `on_displaced` must therefore take only locks that a consumer
-        // never holds while holding this one (the `ChangeSlot` accumulator
-        // qualifies: consumers drain it after releasing the slot).
-        let slot = self.slot.lock().unwrap();
-        let mut slot = slot;
-        let displaced = slot.replace(frame);
-        if displaced.is_some() {
+        let mut slot = self.slot.lock().unwrap();
+        if slot.is_some() {
             self.dropped.fetch_add(1, Ordering::Relaxed);
         } else {
             self.ready.notify_one();
         }
+        *slot = Some(frame);
         self.published.fetch_add(1, Ordering::Relaxed);
-        if let Some(displaced) = displaced {
-            on_displaced(displaced);
-        }
     }
 
     /// Block until a frame is available, then take it.
@@ -164,19 +142,31 @@ pub trait ChangeMeta {
 /// slow — routine at a 16 ms cadence — the producer overwrites the resident
 /// frame and it is gone. Every dirty list DXGI reports is relative to the
 /// previous *acquired* frame, so a frame lost this way leaves the broker's
-/// desktop surface stale exactly where it changed. `ChangeSlot` folds the
-/// displaced frame's rectangles (and its scroll flag) into the metadata handed
-/// out with the next frame, and merges overlaps, so arbitrary backpressure still
-/// yields a bounded delta.
+/// desktop surface stale exactly where it changed.
 ///
-/// Ordering note: the displaced frame's metadata is inserted outside the slot's
-/// lock, so a concurrent [`ChangeSlot::recv`] can drain just before it lands.
-/// That is safe by construction — rectangles are applied as slices of the
-/// *newest* frame's pixels, so a delayed rectangle is repainted correctly one
-/// handoff later. It can be delayed, never lost.
+/// `ChangeSlot` keeps the frame **and** the accumulated changes under one lock
+/// and hands them out together. That single critical section is what makes the
+/// pairing sound: a displaced frame's rectangles can neither be recorded after a
+/// consumer has taken its replacement (they would then wait for a frame that may
+/// never come — the desktop's last change, then silence) nor be drained by a
+/// consumer handing out an *older* frame (they would be painted from that
+/// frame's pixels, which do not contain the change).
 pub struct ChangeSlot<T: ChangeMeta> {
-    slot: LatestSlot<T>,
-    pending: Mutex<(Option<Vec<Rect>>, bool)>,
+    state: Mutex<SlotState<T>>,
+    ready: Condvar,
+    published: AtomicU64,
+    dropped: AtomicU64,
+}
+
+struct SlotState<T> {
+    frame: Option<T>,
+    /// Changes reported since the last handoff. `None` means some frame's
+    /// metadata was unreadable or past budget: the next send must be a keyframe.
+    pending: Option<Vec<Rect>>,
+    /// A scroll seen since the last handoff: the wire cannot express a surface
+    /// copy, so the next send must be a keyframe.
+    moved: bool,
+    closed: bool,
 }
 
 impl<T: ChangeMeta> Default for ChangeSlot<T> {
@@ -196,93 +186,115 @@ fn combine(a: Option<Vec<Rect>>, b: Option<Vec<Rect>>) -> Option<Vec<Rect>> {
     }
 }
 
+/// Merge overlaps and collapse to "unknown" past the per-capture budget, which
+/// is what keeps an arbitrarily long outage (nobody draining) bounded.
+fn bound(pending: &mut Option<Vec<Rect>>) {
+    if let Some(rects) = pending.as_mut() {
+        *rects = merge_rects(rects);
+        if rects.len() > MAX_DIRTY_RECTS {
+            *pending = None;
+        }
+    }
+}
+
+impl<T: ChangeMeta> SlotState<T> {
+    /// Fold one frame's changes into the accumulated set. A method (rather than
+    /// free fields) because the state sits behind a mutex guard: borrowing two
+    /// fields of a `DerefMut` target at once is not allowed.
+    fn accumulate(&mut self, frame: &mut T) {
+        let (dirty, frame_moved) = frame.take_changes();
+        self.pending = combine(self.pending.take(), dirty);
+        self.moved |= frame_moved;
+        bound(&mut self.pending);
+    }
+}
+
 impl<T: ChangeMeta> ChangeSlot<T> {
     pub fn new() -> Self {
         Self {
-            slot: LatestSlot::new(),
-            pending: Mutex::new((Some(Vec::new()), false)),
+            state: Mutex::new(SlotState {
+                frame: None,
+                pending: Some(Vec::new()),
+                moved: false,
+                closed: false,
+            }),
+            ready: Condvar::new(),
+            published: AtomicU64::new(0),
+            dropped: AtomicU64::new(0),
         }
     }
 
     /// Publish a frame, retaining the change metadata of any frame it displaces.
-    ///
-    /// Recording happens inside the slot's critical section (see
-    /// [`LatestSlot::publish_with`]), so a displaced frame's rectangles always
-    /// ride with the very next handoff — never waiting for a frame that may
-    /// never come.
     pub fn publish(&self, frame: T) {
-        self.slot.publish_with(frame, |mut displaced| {
-            let (dirty, moved) = displaced.take_changes();
-            let mut pending = self.pending.lock().unwrap();
-            pending.0 = combine(pending.0.take(), dirty);
-            pending.1 |= moved;
-            // Bounded here, where it grows: while the consumer is blocked (a
-            // server outage, a slow link) every overwrite would otherwise append
-            // for the whole outage. Over budget the accumulator becomes
-            // "unknown", which makes the next frame a keyframe.
-            if let Some(rects) = pending.0.as_mut() {
-                *rects = merge_rects(rects);
-                if rects.len() > MAX_DIRTY_RECTS {
-                    pending.0 = None;
-                }
+        let mut state = self.state.lock().unwrap();
+        if state.closed {
+            return;
+        }
+        let displaced = state.frame.replace(frame);
+        match displaced {
+            Some(mut displaced) => {
+                // Recorded under the same lock that holds the replacement: no
+                // consumer can see the new frame before this runs.
+                state.accumulate(&mut displaced);
+                self.dropped.fetch_add(1, Ordering::Relaxed);
             }
-        });
+            None => self.ready.notify_one(),
+        }
+        self.published.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Take the newest frame together with every change reported since the last
-    /// successful handoff, overlaps merged.
+    /// Block until a frame is available, then take it together with every change
+    /// reported since the last handoff.
     pub fn recv(&self) -> Option<(T, Option<Vec<Rect>>, bool)> {
-        let frame = self.slot.recv()?;
-        Some(self.drain(frame))
+        let mut state = self.state.lock().unwrap();
+        loop {
+            if let Some(taken) = Self::take(&mut state) {
+                return Some(taken);
+            }
+            if state.closed {
+                return None;
+            }
+            state = self.ready.wait(state).unwrap();
+        }
     }
 
     pub fn try_recv(&self) -> Option<(T, Option<Vec<Rect>>, bool)> {
-        let frame = self.slot.try_recv()?;
-        Some(self.drain(frame))
+        let mut state = self.state.lock().unwrap();
+        Self::take(&mut state)
     }
 
-    fn drain(&self, mut frame: T) -> (T, Option<Vec<Rect>>, bool) {
-        let (dirty, moved) = frame.take_changes();
-        let (pending, pending_moved) = {
-            let mut guard = self.pending.lock().unwrap();
-            // Reset to "nothing outstanding" — `take()` would leave `None`,
-            // which the union reads as "metadata was unreadable".
-            (guard.0.replace(Vec::new()), std::mem::replace(&mut guard.1, false))
-        };
-        let merged = combine(pending, dirty).map(|rects| merge_rects(&rects));
-        (frame, merged, moved || pending_moved)
+    /// The frame and its accumulated metadata leave in one critical section, so
+    /// metadata always describes the frame it is handed out with.
+    fn take(state: &mut SlotState<T>) -> Option<(T, Option<Vec<Rect>>, bool)> {
+        let mut frame = state.frame.take()?;
+        let (dirty, frame_moved) = frame.take_changes();
+        let pending = combine(state.pending.replace(Vec::new()), dirty);
+        let moved = frame_moved || std::mem::replace(&mut state.moved, false);
+        Some((frame, pending.map(|rects| merge_rects(&rects)), moved))
     }
 
+    /// Mark the producer gone: waiting receivers return `None`.
     pub fn close(&self) {
-        self.slot.close();
+        let mut state = self.state.lock().unwrap();
+        state.closed = true;
+        self.ready.notify_all();
     }
 
     pub fn is_closed(&self) -> bool {
-        self.slot.is_closed()
+        self.state.lock().unwrap().closed
     }
 
+    /// Frames published so far.
     pub fn published(&self) -> u64 {
-        self.slot.published()
+        self.published.load(Ordering::Relaxed)
     }
 
+    /// Frames overwritten before the consumer could take them.
     pub fn dropped(&self) -> u64 {
-        self.slot.dropped()
+        self.dropped.load(Ordering::Relaxed)
     }
 }
 
-/// Fingerprint a BGRA frame **exactly**: every byte participates.
-///
-/// An earlier version sampled one byte every 64. That is wrong, not merely
-/// approximate: a 1920-pixel BGRA row is 7680 bytes, a multiple of 64, so the
-/// stride landed on the *same* byte of the same sub-pixel column in every row
-/// (always the blue channel). A red- or green-only change confined to the
-/// unsampled pixels produced an identical fingerprint, and the capture loop
-/// treated a real screen update as "unchanged" and never recorded it.
-///
-/// This fold reads 8 bytes at a time, so it costs a few operations per word
-/// rather than per byte and is still a whole-buffer function (see
-/// `examples/client_cost.rs` for the measured cost against the byte-wise
-/// baseline).
 pub fn frame_fingerprint(bgra: &[u8]) -> u64 {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
     for w in bgra.as_chunks::<8>().0 {
