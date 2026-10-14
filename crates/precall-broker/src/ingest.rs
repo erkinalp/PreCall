@@ -402,12 +402,26 @@ impl Broker {
                         let invalid = std::sync::Arc::clone(&store.surface_invalid);
                         let data = f.data.clone();
                         let cid_log = *client_id;
+                        let expected = store.display;
                         let _ = tokio::task::spawn_blocking(move || {
                             record_compose_thread();
                             match crate::canvas::Canvas::from_jpeg(&data) {
-                                Ok(c) => {
+                                Ok(c) if dimensions_match(expected, c.width(), c.height()) => {
                                     *canvas.lock().unwrap() = Some(c);
                                     invalid.store(false, std::sync::atomic::Ordering::Relaxed);
+                                }
+                                Ok(c) => {
+                                    // A frame whose rectangle claims the surface
+                                    // but whose image is a different size would
+                                    // make every later delta clip into the wrong
+                                    // canvas.
+                                    *canvas.lock().unwrap() = None;
+                                    invalid.store(true, std::sync::atomic::Ordering::Relaxed);
+                                    warn!(
+                                        client = %cid_log,
+                                        image = ?(c.width(), c.height()),
+                                        "keyframe size does not match the advertised surface, surface invalidated"
+                                    );
                                 }
                                 Err(e) => {
                                     // Do not keep the old surface: the client's
@@ -461,8 +475,9 @@ impl Broker {
                     let composed = if invalid {
                         None
                     } else {
+                        let expected = store.display;
                         match tokio::task::spawn_blocking(move || {
-                            compose(canvas, codec_id, &rects, base)
+                            compose(canvas, codec_id, &rects, base, expected)
                         })
                         .await
                         {
@@ -638,6 +653,17 @@ pub enum Display {
     Surface { width: u32, height: u32 },
 }
 
+/// Does a decoded image match the surface the client advertised?
+///
+/// A client that advertised nothing (`Display::Unknown`) cannot be checked, and
+/// is accepted as before.
+fn dimensions_match(display: Display, width: u32, height: u32) -> bool {
+    match display {
+        Display::Unknown => true,
+        Display::Surface { width: w, height: h } => width == w && height == h,
+    }
+}
+
 /// Quality of the composed archive frame.
 const COMPOSED_JPEG_QUALITY: u8 = 85;
 
@@ -653,6 +679,7 @@ fn compose(
     codec_id: u16,
     rects: &[(Rect, bytes::Bytes)],
     base: Option<bytes::Bytes>,
+    expected: Display,
 ) -> Option<Vec<u8>> {
     record_compose_thread();
     if codec_id != RDPGFX_CODECID_JPEG {
@@ -686,7 +713,16 @@ fn compose(
             }
         };
         match crate::canvas::Canvas::from_jpeg(&base) {
-            Ok(seeded) => *guard = Some(seeded),
+            Ok(seeded) if dimensions_match(expected, seeded.width(), seeded.height()) => {
+                *guard = Some(seeded)
+            }
+            Ok(seeded) => {
+                warn!(
+                    image = ?(seeded.width(), seeded.height()),
+                    "archived frame does not match the advertised surface; not seeding from it"
+                );
+                return None;
+            }
             Err(e) => {
                 warn!("cannot seed the surface from the previous capture: {e}");
                 return None;

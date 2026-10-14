@@ -164,9 +164,10 @@ async fn dirty_rect_frames_are_composed_into_a_full_frame_archive() {
     .await
     .expect("handshake");
 
-    // Keyframe: a full 64x64 white desktop.
+    // Keyframe: a full white desktop at the size the mock advertises. The
+    // surface is only adopted if the image matches the advertised dimensions.
     let base = SyntheticFrame {
-        jpeg: solid_jpeg(64, 64, [255, 255, 255]),
+        jpeg: solid_jpeg(1280, 720, [255, 255, 255]),
         meta: sample_meta(1, "base-1"),
     };
     session.send_capture(&base).await.unwrap();
@@ -209,7 +210,7 @@ async fn dirty_rect_frames_are_composed_into_a_full_frame_archive() {
     // desktop with both patches applied in their rectangles.
     let bytes = objects.get(&client_id.to_string(), &rel, &token).unwrap();
     let img = image::load_from_memory(&bytes).unwrap().to_rgb8();
-    assert_eq!((img.width(), img.height()), (64, 64));
+    assert_eq!((img.width(), img.height()), (1280, 720));
     let px = |x: u32, y: u32| img.get_pixel(x, y).0;
     let near = |p: [u8; 3], want: [u8; 3]| p.iter().zip(want.iter()).all(|(a, b)| a.abs_diff(*b) <= 6);
     assert!(near(px(32, 28), [255, 0, 0]), "red patch composed: {:?}", px(32, 28));
@@ -432,9 +433,10 @@ async fn composing_a_delta_does_not_block_the_runtime_worker() {
     .await
     .expect("handshake");
 
-    // A 1080p keyframe gives the compositor a 1080p surface to encode from.
+    // A keyframe matching the advertised surface, so the compositor has a
+    // surface to work on at all.
     let base = SyntheticFrame {
-        jpeg: solid_jpeg(1920, 1080, [255, 255, 255]),
+        jpeg: solid_jpeg(1280, 720, [255, 255, 255]),
         meta: sample_meta(1, "base-1"),
     };
     session.send_capture(&base).await.unwrap();
@@ -476,7 +478,7 @@ async fn composing_a_delta_does_not_block_the_runtime_worker() {
         .join(format!("{token}.jpg"));
     let bytes = objects.get(&client_id.to_string(), &rel, &token).unwrap();
     let img = image::load_from_memory(&bytes).unwrap();
-    assert_eq!((img.width(), img.height()), (1920, 1080));
+    assert_eq!((img.width(), img.height()), (1280, 720));
     handle.abort();
 
     // Placement, not timing: on one worker a synchronous compose would run on
@@ -829,5 +831,80 @@ async fn a_rejected_keyframe_invalidates_the_surface() {
     assert!(
         objects.exists(&rel.join(format!("{token}.raw"))),
         "the delta after a rejected keyframe is a blob, not a composition onto a stale surface"
+    );
+}
+
+/// A keyframe whose rectangle claims the whole surface but whose image is a
+/// different size must not become the surface: every later delta would clip into
+/// the wrong canvas and the archive would be the wrong size.
+#[tokio::test]
+async fn a_wrong_sized_keyframe_does_not_become_the_surface() {
+    let dir = tempfile::tempdir().unwrap();
+    let (certs, key, fingerprint) = test_cert();
+    let tls_cfg = tls::server_config_from(certs, key).unwrap();
+    let broker = Arc::new(Broker::new(config(dir.path()), tls_cfg).unwrap());
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let b = Arc::clone(&broker);
+    let handle = tokio::spawn(async move { b.run_on(listener).await });
+
+    let client_id = Uuid::new_v4();
+    let tls = pinned_client_config(&fingerprint).unwrap();
+    let mut session = Session::connect(
+        addr,
+        "localhost",
+        tls,
+        AuthMethod::Psk { token: PSK.into() },
+        client_id,
+        "WRONGSIZE",
+    )
+    .await
+    .expect("handshake");
+
+    // 640x360 bytes on a full-surface (1280x720) rectangle.
+    let wrong = SyntheticFrame {
+        jpeg: solid_jpeg(640, 360, [255, 255, 255]),
+        meta: sample_meta(1, "wrong-1"),
+    };
+    session.send_capture(&wrong).await.unwrap();
+    let db = dir.path().join(client_id.to_string()).join("ukg.db");
+    assert_eq!(wait_for_captures(&db, 1).await, 1);
+
+    // A delta after it must not be composed into a 640x360 canvas.
+    let one = vec![(Rect::new(0, 0, 50, 50), solid_jpeg(50, 50, [1, 2, 3]))];
+    let frame = SyntheticFrame { jpeg: vec![], meta: sample_meta(2, "delta-2") };
+    session.send_dirty_regions(&one, &frame.meta).await.unwrap();
+    assert_eq!(wait_for_captures(&db, 2).await, 2);
+    session.close().await.unwrap();
+    handle.abort();
+
+    let client_dir = dir.path().join(client_id.to_string());
+    let ukg = Ukg::open(&db).unwrap();
+    let timeline = ukg.timeline(None, 10).unwrap();
+    let token = ukg.image_token(timeline[0].id).unwrap().unwrap();
+    assert_eq!(token, "delta-2");
+    let (y, m, d) = precall_broker::filetime_to_ymd(timeline[0].timestamp_100ns);
+    let rel = std::path::PathBuf::from(client_id.to_string())
+        .join(format!("{y:04}"))
+        .join(format!("{m:02}"))
+        .join(format!("{d:02}"));
+
+    // The keyframe was still archived (the client labelled it as an image), but
+    // it never became the surface.
+    let wrong_token = ukg.image_token(timeline[1].id).unwrap().unwrap();
+    assert_eq!(wrong_token, "wrong-1");
+    let (wy, wm, wd) = precall_broker::filetime_to_ymd(timeline[1].timestamp_100ns);
+    let wrong_rel = std::path::PathBuf::from(client_id.to_string())
+        .join(format!("{wy:04}"))
+        .join(format!("{wm:02}"))
+        .join(format!("{wd:02}"))
+        .join(format!("{wrong_token}.jpg"));
+
+    let key = load_or_create_key(dir.path()).unwrap();
+    let objects = ObjectStore::encrypted(client_dir.join("objects"), key).unwrap();
+    assert!(objects.exists(&wrong_rel), "the keyframe is archived as sent");
+    assert!(
+        objects.exists(&rel.join(format!("{token}.raw"))),
+        "the delta is a blob: the wrong-sized keyframe was not adopted as the surface"
     );
 }

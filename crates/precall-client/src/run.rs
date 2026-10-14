@@ -166,18 +166,13 @@ pub async fn run(cfg: ClientConfig, mut stop: watch::Receiver<bool>) -> Result<(
         let mut hb_tick =
             tokio::time::interval(std::time::Duration::from_millis(conn.hello.heartbeat_interval_ms.max(5000) as u64));
         let mut latest_frame: Option<BridgedFrame> = None;
-        // Frames captured before this handshake may describe a *different*
-        // desktop (the duplicator is re-created on a mode change). Drop those,
-        // but keep the newest one that matches the current generation: DXGI need
-        // not publish another frame while the desktop is static, so discarding
-        // everything could leave this session with nothing to send at all.
-        while let Ok((frame, dirty, moved)) = frame_chan.try_recv() {
-            if frame.generation == capture_geometry.generation {
-                // Newest matching frame wins; earlier matching ones are stale
-                // copies of the same desktop, so their metadata is dropped.
-                latest_frame = Some((frame, dirty, moved));
-            }
-        }
+        // The snapshot above was taken *before* the handshake: the capture thread
+        // may have created or re-created the duplicator while it was in flight,
+        // in which case the current generation is the newer one and the frames we
+        // just received belong to it. Re-read before deciding what to keep.
+        let capture_geometry = *geometry.lock().unwrap();
+        last_generation = capture_geometry.generation;
+        retain_current_generation(&mut latest_frame, &mut frame_chan, last_generation);
         // Fingerprint of the last frame *successfully transmitted* through the
         // metadata-less path, and only for *this* session: the broker's new
         // session has no surface, so a previous session's hash must never
@@ -215,6 +210,9 @@ pub async fn run(cfg: ClientConfig, mut stop: watch::Receiver<bool>) -> Result<(
                     force_keyframe = true;
                     pending_dirty = Some(Vec::new());
                     pending_moved = false;
+                    // A resident or queued frame from the old duplicator must not
+                    // be sent as the new generation's keyframe.
+                    retain_current_generation(&mut latest_frame, &mut frame_chan, last_generation);
                 }
                 if current.width > 0 && (current.width, current.height) != advertised {
                     tracing::info!(
@@ -550,6 +548,31 @@ fn bound_pending(pending: &mut Option<Vec<precall_frame::Rect>>) {
         if rects.len() > precall_frame::MAX_DIRTY_RECTS {
             *pending = None;
         }
+    }
+}
+
+/// Keep the newest frame that belongs to `generation`, dropping the rest.
+///
+/// Frames from an older duplicator describe a different desktop (a mode change
+/// re-creates it), so they must not be sent as a keyframe for the new one — but
+/// DXGI need not publish another frame while the desktop is static, so the
+/// newest *matching* frame is retained rather than the queue being emptied.
+fn retain_current_generation(
+    latest: &mut Option<BridgedFrame>,
+    chan: &mut tokio::sync::mpsc::Receiver<BridgedFrame>,
+    generation: u64,
+) {
+    if latest.as_ref().is_some_and(|(f, _, _)| f.generation != generation) {
+        *latest = None;
+    }
+    let mut newest: Option<BridgedFrame> = None;
+    while let Ok(frame) = chan.try_recv() {
+        if frame.0.generation == generation {
+            newest = Some(frame);
+        }
+    }
+    if newest.is_some() {
+        *latest = newest;
     }
 }
 
